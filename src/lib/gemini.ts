@@ -227,6 +227,76 @@ const extractDayNumbers = (text: string): number[] => {
     return days.sort((a, b) => a - b);
 };
 
+export async function evaluateMutationProposal(
+    proposal: string,
+    currentStats: { infected: number; zombies: number; elapsedDays: number },
+    apiMeta: { isExternalAPI: boolean; apiUrl: string; apiKey: string; providerName: string; textModel: string }
+): Promise<{ approved: boolean; cost: number; reason: string; name: string }> {
+    const prompt = `You are the strict Game Master of a virus outbreak simulation.
+A player wants to evolve the virus with a custom mutation.
+Your task is to evaluate the proposal for balance, feasibility, and flavor.
+
+Current Game State:
+- Day: ${currentStats.elapsedDays}
+- Total Infected (Living): ${currentStats.infected}
+- Total Zombies: ${currentStats.zombies}
+
+Player Proposal: "${proposal}"
+
+CRITICAL RULES:
+1. NO INSTANT WINS: Reject mutations like "everyone dies", "humanity surrenders", or "instant 100% infection".
+2. BALANCED COST: Assign a cost between 20 and 1000 Mutation Points.
+   - Minor (e.g., slight speed boost, cosmetic change): 20-50 pts.
+   - Significant (e.g., new transmission vector like water, basic resistance): 100-200 pts.
+   - Major (e.g., airborne transmission, intelligence, heavy physical armor): 300-600 pts.
+   - Game-Changer (e.g., global coordination, immunity to vaccines): 800-1000 pts.
+3. REASONING: Explain your verdict briefly and flavorfully as a research report.
+4. NAMING: Provide a short, scientific or ominous name for the mutation (2-3 words).
+
+Return ONLY a JSON object:
+{
+  "approved": boolean,
+  "cost": number,
+  "reason": "string",
+  "name": "string"
+}`;
+
+    let raw = "";
+    if (apiMeta.isExternalAPI) {
+        const res = await fetch(apiMeta.apiUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiMeta.apiKey}`,
+                "HTTP-Referer": window.location.href,
+                "X-Title": "Project Z"
+            },
+            body: JSON.stringify({
+                model: apiMeta.textModel,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.3
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
+        raw = data.choices?.[0]?.message?.content || "";
+    } else {
+        const ai = getGenAI();
+        const response = await ai.models.generateContent({
+            model: apiMeta.textModel || "gemini-3.1-pro-preview",
+            contents: prompt,
+            config: { temperature: 0.3 }
+        });
+        raw = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    }
+
+    const result = parseJsonObject(raw);
+    if (!result || typeof result.approved !== 'boolean') {
+        throw new Error("Failed to parse mutation evaluation from AI.");
+    }
+    return result as { approved: boolean; cost: number; reason: string; name: string };
+}
+
 export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<string> {
     const isExternalAPI = params.textProvider === 'openai' || params.textProvider === 'openrouter';
     const apiUrl = params.textProvider === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
@@ -253,6 +323,10 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
         totalGenerations = 12;
     }
 
+    const mutationDescription = params.activeMutations?.length > 0 
+        ? `\nАКТИВНЫЕ МУТАЦИИ ВИРУСА:\n${params.activeMutations.map((m: any) => `- ${m.name}: ${m.description} (Применена на день ${m.dayApplied})`).join('\n')}`
+        : '';
+
     const masterPrompt = `Ты - Мастер Симуляции Вируса (Уровень Стратегии).
 Твоя задача — составить стратегический план (промпт) для другой нейросети-логгера на следующий период: ${params.stepAmount}.
 
@@ -261,6 +335,7 @@ ${params.scenario}
 
 Фазы симптомов вируса:
 ${params.symptomDescription || 'Не указаны'}
+${mutationDescription}
 
 Стартовая позиция: ${params.location}
 Контекст местности и ближайших объектов:
@@ -325,6 +400,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
 
 План Мастера Симуляции:
 ${masterPlan}
+${mutationDescription}
 
 КОНТЕКСТ МЕСТНОСТИ И БЛИЖАЙШИХ ОБЪЕКТОВ:
 ${params.terrainContext || 'Контекст местности недоступен. Не ставь события в воду, лес, поле или пустую местность без явной сюжетной причины.'}
