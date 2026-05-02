@@ -76,7 +76,7 @@ const mergeMapData = (base: any, delta: any) => {
     };
 };
 
-const DAY_HEADER_REGEX = /(?:^|\n)[ \t]*(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\([^)\n]+\))?[ \t]*(?:\*\*)?[ \t]*(?::)?[ \t]*(?:\*\*)?/g;
+const DAY_HEADER_REGEX = /(?:^|\n|[ \t]|[\.\!\?])(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\([^)\n]+\))?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*/g;
 
 const getDayHeaderMatches = (text: string) => Array.from(text.matchAll(DAY_HEADER_REGEX));
 
@@ -103,6 +103,11 @@ ${safeStringify(normalizeMapData(currentMapData))}
 
 Master strategic plan:
 ${masterContext?.masterPlan || 'No master plan available.'}
+
+Active viral mutations:
+${params.activeMutations?.length > 0 
+    ? params.activeMutations.map((m: any) => `- ${m.name}: ${m.description}`).join('\n')
+    : 'No active mutations.'}
 
 Geographic and terrain context:
 ${params.terrainContext || `Origin coordinates: ${params.location}. Terrain lookup was not available.`}
@@ -227,12 +232,83 @@ const extractDayNumbers = (text: string): number[] => {
     return days.sort((a, b) => a - b);
 };
 
+export async function evaluateMutationProposal(
+    proposal: string,
+    currentStats: { infected: number; zombies: number; elapsedDays: number },
+    apiMeta: { isExternalAPI: boolean; apiUrl: string; apiKey: string; providerName: string; textModel: string }
+): Promise<{ approved: boolean; cost: number; reason: string; name: string }> {
+    const prompt = `You are the strict Game Master of a virus outbreak simulation.
+A player wants to evolve the virus with a custom mutation.
+Your task is to evaluate the proposal for balance, feasibility, and flavor.
+
+Current Game State:
+- Day: ${currentStats.elapsedDays}
+- Total Infected (Living): ${currentStats.infected}
+- Total Zombies: ${currentStats.zombies}
+
+Player Proposal: "${proposal}"
+
+CRITICAL RULES:
+1. NO INSTANT WINS: Reject mutations like "everyone dies", "humanity surrenders", or "instant 100% infection".
+2. BALANCED COST: Assign a cost between 20 and 1000 Mutation Points.
+   - Minor (e.g., slight speed boost, cosmetic change): 20-50 pts.
+   - Significant (e.g., new transmission vector like water, basic resistance): 100-200 pts.
+   - Major (e.g., airborne transmission, intelligence, heavy physical armor): 300-600 pts.
+   - Game-Changer (e.g., global coordination, immunity to vaccines): 800-1000 pts.
+3. REASONING: Explain your verdict briefly and flavorfully as a research report.
+4. NAMING: Provide a short, scientific or ominous name for the mutation (2-3 words).
+
+Return ONLY a JSON object:
+{
+  "approved": boolean,
+  "cost": number,
+  "reason": "string",
+  "name": "string"
+}`;
+
+    let raw = "";
+    if (apiMeta.isExternalAPI) {
+        const res = await fetch(apiMeta.apiUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiMeta.apiKey}`,
+                "HTTP-Referer": window.location.href,
+                "X-Title": "Project Z"
+            },
+            body: JSON.stringify({
+                model: apiMeta.textModel,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.3
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
+        raw = data.choices?.[0]?.message?.content || "";
+    } else {
+        const ai = getGenAI();
+        const response = await ai.models.generateContent({
+            model: apiMeta.textModel || "gemini-3.1-pro-preview",
+            contents: prompt,
+            config: { temperature: 0.3 }
+        });
+        raw = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    }
+
+    const result = parseJsonObject(raw);
+    if (!result || typeof result.approved !== 'boolean') {
+        throw new Error("Failed to parse mutation evaluation from AI.");
+    }
+    return result as { approved: boolean; cost: number; reason: string; name: string };
+}
+
 export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<string> {
     const isExternalAPI = params.textProvider === 'openai' || params.textProvider === 'openrouter';
     const apiUrl = params.textProvider === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
     const apiKey = params.textProvider === 'openrouter' ? params.openRouterKey : params.openAiKey;
     const providerName = params.textProvider === 'openrouter' ? "OpenRouter" : "OpenAI";
     const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName };
+    const onNotification = params.onNotification;
     let daysToSimulate = 1;
     let daysPerGeneration = 1;
     let totalGenerations = 1;
@@ -253,6 +329,10 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
         totalGenerations = 12;
     }
 
+    const mutationDescription = params.activeMutations?.length > 0 
+        ? `\nАКТИВНЫЕ МУТАЦИИ ВИРУСА:\n${params.activeMutations.map((m: any) => `- ${m.name}: ${m.description} (Применена на день ${m.dayApplied})`).join('\n')}`
+        : '';
+
     const masterPrompt = `Ты - Мастер Симуляции Вируса (Уровень Стратегии).
 Твоя задача — составить стратегический план (промпт) для другой нейросети-логгера на следующий период: ${params.stepAmount}.
 
@@ -261,6 +341,7 @@ ${params.scenario}
 
 Фазы симптомов вируса:
 ${params.symptomDescription || 'Не указаны'}
+${mutationDescription}
 
 Стартовая позиция: ${params.location}
 Контекст местности и ближайших объектов:
@@ -273,7 +354,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
 Составь стратегический план развития на ${daysToSimulate} дней (с дня ${params.elapsedDays + 1} до ${params.elapsedDays + daysToSimulate}). 
 Опиши, какие основные события/фазы должны произойти за это время. Отвечай только планом.`;
 
-    yield `\n**[МАСТЕР СИМУЛЯЦИИ]** Выполняется расчет макро-стратегии на ${params.stepAmount}...\n\n`;
+    onNotification?.(`МАСТЕР СИМУЛЯЦИИ: расчет макро-стратегии на ${params.stepAmount}...`, 'info');
 
     let masterPlan = "План не сгенерирован.";
 
@@ -305,7 +386,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
         masterPlan = masterResponse.candidates?.[0]?.content?.parts?.[0]?.text || "План не сгенерирован.";
     }
 
-    yield `**[ПЛАН УТВЕРЖДЕН]** Запуск серии генераций для детализации событий (Итераций: ${totalGenerations})...\n\n`;
+    onNotification?.(`ПЛАН УТВЕРЖДЕН: запуск ${totalGenerations} итераций детализации.`, 'info');
 
     let fullTimelineContext = stripMapDataBlocks(params.previousTimeline || "");
     let fullSimulationTimelineForMaster = fullTimelineContext;
@@ -325,6 +406,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
 
 План Мастера Симуляции:
 ${masterPlan}
+${mutationDescription}
 
 КОНТЕКСТ МЕСТНОСТИ И БЛИЖАЙШИХ ОБЪЕКТОВ:
 ${params.terrainContext || 'Контекст местности недоступен. Не ставь события в воду, лес, поле или пустую местность без явной сюжетной причины.'}
@@ -332,10 +414,14 @@ ${params.terrainContext || 'Контекст местности недоступ
 ПОЛНЫЙ КОНТЕКСТ УЖЕ СГЕНЕРИРОВАННЫХ ДНЕЙ:
 ${fullTimelineContext || 'Ранее событий нет.'}
 
-Твоя задача: расписать ${daysInstruction}
+Твоя задача: расписать ${daysInstruction}. 
+Текущая дата для Дня ${startDayIndex}: ${params.currentDate}.
 
 КРИТИЧЕСКИЕ ПРАВИЛА ФОРМАТА:
-1. Для КАЖДОГО дня твоего периода вывод ДОЛЖЕН СТРОГО начинаться со строки: DAY_{НОМЕР_ДНЯ} (Дата):
+1. Для КАЖДОГО дня твоего периода вывод ДОЛЖЕН СТРОГО начинаться С НОВОЙ СТРОКИ (лучше с двойного переноса строки) со строки: DAY_{НОМЕР_ДНЯ} (Дата):
+   Пример: 
+   
+   DAY_${startDayIndex} (${params.currentDate}):
 2. Далее по часам (формат ЧЧ:ММ). Частота генерации событий в течение дня: ${params.eventFrequency || 'на твое усмотрение'}. Генерируй события строго с этим интервалом (например, если указано "30 минут", то 08:00, 08:30, 09:00 и т.д.).
 3. НЕ выводи MAP_DATA, JSON или любые технические логи для карты. Всю информацию карты и счетчики после твоего текста рассчитывает только Мастер Симуляции.
 4. События должны учитывать реальную местность из контекста: если точка в пруду/озере/лесу/поле, люди, транспорт, клиники, базы и блокпосты должны появляться на ближайшей суше, дорогах, берегах, поселениях или подходящих объектах, а не в самой воде или пустой местности.
@@ -465,10 +551,8 @@ ${fullTimelineContext || 'Ранее событий нет.'}
             }
         } catch (e: any) {
             console.warn("Map state generation failed", e);
-            yield `\n\n*[Map state update failed: ${e.message || e}]*`;
+            onNotification?.(`Ошибка обновления карты: ${e.message || e}`, 'warning');
         }
-        
-        yield `\n\n`;
         
         if (totalGenerations > 1) {
             await new Promise(r => setTimeout(r, 1000));

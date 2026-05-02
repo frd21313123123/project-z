@@ -19,6 +19,14 @@ export interface Scenario {
   symptoms: string;
 }
 
+export interface Mutation {
+  id: string;
+  name: string;
+  description: string;
+  cost: number;
+  dayApplied: number;
+}
+
 export interface UserSettings {
   textProvider: 'gemini' | 'openai' | 'openrouter';
   textModel: string;
@@ -31,6 +39,8 @@ export interface UserSettings {
   textScale?: number;
   scenarios?: Scenario[];
   selectedScenarioId?: string;
+  mutationPoints?: number;
+  mutations?: Mutation[];
 }
 
 export interface UserProfile {
@@ -68,6 +78,8 @@ export const DEFAULT_SETTINGS: UserSettings = {
   textScale: 1.0,
   scenarios: DEFAULT_SCENARIOS,
   selectedScenarioId: 'default_zombie',
+  mutationPoints: 50,
+  mutations: [],
 };
 
 async function hashPassword(password: string): Promise<string> {

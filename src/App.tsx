@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { MapView } from './components/MapView';
 import { AuthScreen } from './components/AuthScreen';
-import { simulateOutbreakStepStream, generateCityImage, buildCityImagePrompt } from './lib/gemini';
+import { simulateOutbreakStepStream, generateCityImage, buildCityImagePrompt, evaluateMutationProposal } from './lib/gemini';
 import { buildTerrainContext } from './lib/geoContext';
 import { getSessionUsername, getUserSettings, saveUserSettings, logoutUser, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS } from './lib/auth';
 import ReactMarkdown from 'react-markdown';
-import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, Play, UserRound, Skull } from 'lucide-react';
+import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, Play, UserRound, Skull, Microscope, Dna } from 'lucide-react';
 import menuBackground from '../background.png';
 
 interface TimelineEvent {
@@ -14,6 +14,12 @@ interface TimelineEvent {
   text: string;
   raw: string;
   mapData?: any;
+}
+
+interface Notification {
+  id: string;
+  message: string;
+  type: 'info' | 'error' | 'warning';
 }
 
 const emptyMapData = () => ({ infected: [], movements: [], pois: [], perimeters: [], stats: { infected: 0, zombies: 0 } });
@@ -43,7 +49,7 @@ const getZombieCount = (mapData: any) => {
 
 const formatCounter = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
 
-const DAY_HEADER_REGEX = /(?:^|\n)[ \t]*(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\(([^)\n]+)\))?[ \t]*(?:\*\*)?[ \t]*(?::)?[ \t]*(?:\*\*)?/g;
+const DAY_HEADER_REGEX = /(?:^|\n|[ \t]|[\.\!\?])(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\(([^)\n]+)\))?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*/g;
 
 const buildMapDataSnapshot = (events: TimelineEvent[], lastIndex: number, snapshots: Record<number, any>) => {
   if (!events.length || lastIndex < 0) return emptyMapData();
@@ -70,6 +76,8 @@ export default function App() {
   const [isMainMenu, setIsMainMenu] = useState(true);
   const [isRoleSelectOpen, setIsRoleSelectOpen] = useState(false);
   const [isScenarioSelectOpen, setIsScenarioSelectOpen] = useState(false);
+  const [isDiseaseWindowOpen, setIsDiseaseWindowOpen] = useState(false);
+  const [diseaseTab, setDiseaseTab] = useState<'overview' | 'phases'>('overview');
 
   const handleAuthSuccess = useCallback(() => {
     setIsAuthed(true);
@@ -86,6 +94,8 @@ export default function App() {
     setSymptomPhases(saved.symptomPhases || DEFAULT_SYMPTOM_PHASES);
     setScenarios(saved.scenarios || DEFAULT_SCENARIOS);
     setSelectedScenarioId(saved.selectedScenarioId || 'default_zombie');
+    setMutationPoints(saved.mutationPoints ?? 50);
+    setActiveMutations(saved.mutations || []);
   }, []);
 
   const handleLogout = useCallback(() => {
@@ -135,8 +145,8 @@ export default function App() {
   const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({});
   const [isSimulating, setIsSimulating] = useState(false);
   const [isImageGenerating, setIsImageGenerating] = useState(false);
-  const [stepAmount, setStepAmount] = useState('1 неделя');
-  const [eventFrequency, setEventFrequency] = useState('30 минут');
+  const [stepAmount, setStepAmount] = useState('3 дня');
+  const [eventFrequency, setEventFrequency] = useState('3 часа');
   const [images, setImages] = useState<Record<number, string>>({});
   const [imagePrompts, setImagePrompts] = useState<Record<number, string>>({});
   const [mainView, setMainView] = useState<'split' | 'map' | 'chat'>('split');
@@ -151,8 +161,25 @@ export default function App() {
   const [showMapOverlay, setShowMapOverlay] = useState(() => getUserSettings().showMapOverlay);
   const [symptomPhases, setSymptomPhases] = useState<SymptomPhase[]>(() => getUserSettings().symptomPhases || DEFAULT_SYMPTOM_PHASES);
   const [textScale, setTextScale] = useState<number>(() => getUserSettings().textScale ?? 1.0);
+  
+  // Mutation states
+  const [mutationPoints, setMutationPoints] = useState<number>(() => getUserSettings().mutationPoints ?? 50);
+  const [activeMutations, setActiveMutations] = useState<any[]>(() => getUserSettings().mutations || []);
+  const [mutationProposal, setMutationProposal] = useState('');
+  const [evaluationResult, setEvaluationResult] = useState<{ approved: boolean; cost: number; reason: string; name: string } | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+
   const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  const addNotification = useCallback((message: string, type: Notification['type'] = 'info') => {
+    const id = Math.random().toString(36).substring(2, 9);
+    setNotifications(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== id));
+    }, 5000);
+  }, []);
 
   // Auto-save settings whenever they change
   useEffect(() => {
@@ -160,19 +187,19 @@ export default function App() {
     const settings: UserSettings = {
       textProvider, textModel, imageModel, imageMode,
       openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale,
-      scenarios, selectedScenarioId
+      scenarios, selectedScenarioId,
+      mutationPoints, mutations: activeMutations
     };
     saveUserSettings(settings);
-  }, [textProvider, textModel, imageModel, imageMode, openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale, scenarios, selectedScenarioId, isAuthed]);
+  }, [textProvider, textModel, imageModel, imageMode, openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale, scenarios, selectedScenarioId, isAuthed, mutationPoints, activeMutations]);
 
   const timelineEndRef = useRef<HTMLDivElement>(null);
 
   const parsedEvents = useMemo(() => {
     const events: TimelineEvent[] = [];
-    // Match DAY_X headers with optional dates and markdown wrappers.
-    // The model occasionally omits "(Date)", and the map/day split must still stay correct.
     const headerRegex = new RegExp(DAY_HEADER_REGEX);
     
+    // Find all matches for DAY_X
     const matches = Array.from(timeline.matchAll(headerRegex));
 
     for (let i = 0; i < matches.length; i++) {
@@ -180,12 +207,13 @@ export default function App() {
       const dayNum = parseInt(match[1], 10);
       const dateStr = match[2] || `DAY_${dayNum}`;
       
-      const startIndex = match.index + match[0].length;
-      const endIndex = i + 1 < matches.length ? matches[i + 1].index : timeline.length;
+      const headerStartIndex = match.index;
+      const nextMatchIndex = i + 1 < matches.length ? matches[i + 1].index : timeline.length;
       
-      let rawText = timeline.substring(startIndex, endIndex).trim();
+      // The text of this day starts after its header and ends before the next day's header
+      let rawText = timeline.substring(headerStartIndex + match[0].length, nextMatchIndex).trim();
 
-      // Process MAP_DATA
+      // Process MAP_DATA if it exists within this day's block
       let mapData = undefined;
       const mapStartIndex = rawText.indexOf('[MAP_DATA:');
       if (mapStartIndex !== -1) {
@@ -202,9 +230,10 @@ export default function App() {
             const jsonStr = rawText.substring(jsonStart, jsonEnd + 1);
             try {
               mapData = JSON.parse(jsonStr);
+              // Clean up the text by removing the technical block
               rawText = rawText.substring(0, mapStartIndex).trim() + '\n' + rawText.substring(mapEndIndex + 1).trim();
             } catch (e) {
-              // silently ignore parse errors during streaming
+              // Ignore parse errors
             }
           }
         }
@@ -219,8 +248,7 @@ export default function App() {
       });
     }
 
-    // Use a Map to naturally deduplicate and keep the LAST occurrence.
-    // This allows us to overwrite accidental early generations with their proper, detailed iterations.
+    // Deduplicate: keep the last version of each day (important for streaming)
     const latestEventsMap = new Map<number, TimelineEvent>();
     for (const ev of events) {
       latestEventsMap.set(ev.day, ev);
@@ -237,6 +265,9 @@ export default function App() {
   useEffect(() => {
     if (parsedEvents.length > 0 && selectedDayIndex === -1) {
       setSelectedDayIndex(0);
+    } else if (isSimulating && parsedEvents.length > 0) {
+      // During simulation, always follow the latest day being generated
+      setSelectedDayIndex(parsedEvents.length - 1);
     } else if (!isSimulating && parsedEvents.length > 0 && selectedDayIndex === parsedEvents.length - 2) {
       // Auto-advance to the newly generated day only when generation completes, 
       // and only if the user was on the previous day (meaning they were following along).
@@ -253,8 +284,27 @@ export default function App() {
     }
     
     // Determine current elapsed context
-    const elapsedDays = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].day : 0;
-    const currentParsedDateStr = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].dateStr : startDate;
+    const lastEvent = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1] : null;
+    const elapsedDays = lastEvent ? lastEvent.day : 0;
+    
+    // Calculate the date for the next day
+    let nextDateStr = startDate;
+    if (lastEvent) {
+        try {
+            const lastDate = new Date(lastEvent.dateStr);
+            if (!isNaN(lastDate.getTime())) {
+                const nextDate = new Date(lastDate);
+                nextDate.setDate(nextDate.getDate() + 1);
+                nextDateStr = nextDate.toISOString().split('T')[0];
+            } else {
+                // Fallback to day count if date parsing fails
+                nextDateStr = `День ${elapsedDays + 1}`;
+            }
+        } catch (e) {
+            nextDateStr = `День ${elapsedDays + 1}`;
+        }
+    }
+
     const latestMapData = buildMapDataSnapshot(parsedEvents, parsedEvents.length - 1, mapSnapshots);
 
     try {
@@ -266,15 +316,17 @@ export default function App() {
         startDate,
         scenario: `[Предисловие]: ${activeScenario.preface}\n[Начало/Причина]: ${activeScenario.origin}\n[Симптомы/Особенности]: ${activeScenario.symptoms}`,
         symptomDescription: symptomDesc,
-        currentDate: currentParsedDateStr,
+        currentDate: nextDateStr,
         elapsedDays,
         stepAmount,
         eventFrequency,
         previousTimeline: timeline,
         mapData: latestMapData,
+        activeMutations: activeMutations,
         onMapData: (day: number, mapData: any) => {
           setMapSnapshots(prev => ({ ...prev, [day]: normalizeMapData(mapData) }));
         },
+        onNotification: addNotification,
         textModel,
         textProvider,
         openAiKey,
@@ -283,7 +335,17 @@ export default function App() {
 
       let newTimelineChunk = "";
       for await (const chunk of stream) {
-        setTimeline(prev => prev + chunk);
+        setTimeline(prev => {
+          const updated = prev + chunk;
+          // Check if a new DAY_ header was just added
+          const headerRegex = new RegExp(DAY_HEADER_REGEX);
+          const matches = Array.from(updated.matchAll(headerRegex));
+          if (matches.length > 0) {
+            // If the number of days increased, we might want to switch view
+            // (Note: parsedEvents is updated via useMemo, but we can trigger state change here)
+          }
+          return updated;
+        });
         newTimelineChunk += chunk;
       }
 
@@ -303,7 +365,7 @@ export default function App() {
                  setImages(prev => ({...prev, [lastDayInChunk]: imgBase64}));
               } catch (e: any) {
                  console.error("Image generation failed", e);
-                 setTimeline(prev => prev + '\\n\\n*[Системное предупреждение: не удалось получить визуализацию с дрона: ' + e.message + ']*');
+                 addNotification(`Системное предупреждение: не удалось получить визуализацию с дрона: ${e.message}`, 'warning');
               } finally {
                  setIsImageGenerating(false);
               }
@@ -311,10 +373,20 @@ export default function App() {
               const prompt = buildCityImagePrompt(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`, terrainContext);
               setImagePrompts(prev => ({...prev, [lastDayInChunk]: prompt}));
           }
+
+          // Generate Mutation Points
+          // Logic: 10 points per step + logarithmic bonus for total zombies
+          const daysGenerated = lastDayInChunk - elapsedDays;
+          if (daysGenerated > 0) {
+              const basePoints = daysGenerated * 10;
+              const currentZombies = getZombieCount(buildMapDataSnapshot(parsedEvents, parsedEvents.length - 1, mapSnapshots));
+              const zombieBonus = Math.floor(Math.max(0, Math.log10(currentZombies + 1) * 20));
+              setMutationPoints(prev => prev + basePoints + zombieBonus);
+          }
       }
 
     } catch (e: any) {
-      setTimeline(prev => prev + '\n\n**[СИСТЕМНАЯ ОШИБКА]** ' + e.message);
+      addNotification(`СИСТЕМНАЯ ОШИБКА: ${e.message}`, 'error');
     } finally {
       setIsSimulating(false);
     }
@@ -336,6 +408,69 @@ export default function App() {
   }), [currentDayMapData]);
 
   const currentEvent = parsedEvents[selectedDayIndex];
+
+  const displayTimelineText = useMemo(() => {
+    if (!currentEvent) return '';
+    // Extra safety to strip technical blocks that might have leaked into currentEvent.text
+    return currentEvent.text.replace(/\[MAP_DATA:[\s\S]*?\]/g, "").trim();
+  }, [currentEvent]);
+
+  const handleEvaluateMutation = async () => {
+    if (!mutationProposal.trim()) return;
+    setIsEvaluating(true);
+    setEvaluationResult(null);
+    try {
+      const isExternalAPI = textProvider === 'openai' || textProvider === 'openrouter';
+      const apiUrl = textProvider === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
+      const apiKey = textProvider === 'openrouter' ? openRouterKey : openAiKey;
+      const providerName = textProvider === 'openrouter' ? "OpenRouter" : "OpenAI";
+      
+      const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName, textModel };
+      const currentElapsedDays = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].day : 0;
+      
+      const res = await evaluateMutationProposal(
+        mutationProposal, 
+        { ...outbreakCounters, elapsedDays: currentElapsedDays },
+        apiMeta
+      );
+      setEvaluationResult(res);
+    } catch (e: any) {
+      alert("Ошибка при оценке мутации: " + e.message);
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
+
+  const handleApplyMutation = () => {
+    if (!evaluationResult || !evaluationResult.approved) return;
+    if (mutationPoints < evaluationResult.cost) {
+      alert("Недостаточно Очков Мутации!");
+      return;
+    }
+
+    const newMutation = {
+      id: `mut_${Date.now()}`,
+      name: evaluationResult.name,
+      description: mutationProposal,
+      cost: evaluationResult.cost,
+      dayApplied: parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].day : 0
+    };
+
+    setMutationPoints(prev => prev - evaluationResult.cost);
+    setActiveMutations(prev => [...prev, newMutation]);
+    setMutationProposal('');
+    setEvaluationResult(null);
+  };
+
+  const handleRemoveMutation = (id: string) => {
+    const mutation = activeMutations.find(m => m.id === id);
+    if (!mutation) return;
+
+    if (window.confirm(`Вы уверены, что хотите откатить мутацию "${mutation.name}"? Вам будет возвращено ${mutation.cost} ОМ.`)) {
+      setMutationPoints(prev => prev + mutation.cost);
+      setActiveMutations(prev => prev.filter(m => m.id !== id));
+    }
+  };
 
   if (!isAuthed) {
     return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
@@ -379,8 +514,8 @@ export default function App() {
         )
       ) : (
         <>
-      {/* Header */}
-      <header className="h-16 border-b border-[#333] flex items-center justify-between px-6 bg-[#0A0A0A] shrink-0">
+          {/* Header */}
+          <header className="h-16 border-b border-[#333] flex items-center justify-between px-6 bg-[#0A0A0A] shrink-0">
         <div className="flex items-center gap-4">
           <img src="/logo.png" alt="Project Z Logo" className="w-10 h-10 object-contain" />
           <div className="w-3 h-3 rounded-full bg-red-600 animate-pulse"></div>
@@ -424,7 +559,7 @@ export default function App() {
           <div className="flex-1 overflow-y-auto">
             <div className="p-4 border-b border-[#333]">
               <h2 className="text-xs font-bold text-[#777] mb-4 uppercase tracking-widest flex items-center gap-2">
-                 Viral Profile
+                Viral Profile
               </h2>
               <div className="space-y-4">
                 <div className="flex flex-col gap-1">
@@ -433,170 +568,49 @@ export default function App() {
                     type="date"
                     className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
                     value={startDate}
-                    onChange={e => setStartDate(e.target.value)}
+                    onChange={(e) => setStartDate(e.target.value)}
                     disabled={isSimulating || parsedEvents.length > 0}
                   />
                 </div>
               </div>
             </div>
-
-            <div className="p-4">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xs font-bold text-[#777] uppercase tracking-widest">Symptom Matrix</h2>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => {
-                    const newId = `phase_${Date.now()}`;
-                    setSymptomPhases(prev => [...prev, { id: newId, name: `Phase ${prev.length + 1}`, dayRange: 'D?', description: 'Описание фазы...', color: 'green' }]);
-                    setEditingPhaseId(newId);
-                  }}
-                  disabled={isSimulating || parsedEvents.length > 0}
-                  className="p-1 text-[#555] hover:text-green-500 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                  title="Добавить фазу"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  onClick={() => { setSymptomPhases(DEFAULT_SYMPTOM_PHASES); setEditingPhaseId(null); }}
-                  disabled={isSimulating || parsedEvents.length > 0}
-                  className="p-1 text-[#555] hover:text-orange-500 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                  title="Сбросить к стандартным"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
-            <div className="space-y-2">
-              {symptomPhases.map((phase) => {
-                const colorMap: Record<string, { bar: string; text: string; border: string; bg: string }> = {
-                  blue:   { bar: 'bg-blue-900',   text: 'text-blue-400',   border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
-                  yellow: { bar: 'bg-yellow-900',  text: 'text-yellow-500', border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
-                  red:    { bar: 'bg-red-600',     text: 'text-red-500',    border: 'border-red-900',   bg: 'bg-[#120505]' },
-                  green:  { bar: 'bg-green-900',   text: 'text-green-400',  border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
-                  purple: { bar: 'bg-purple-900',  text: 'text-purple-400', border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
-                  orange: { bar: 'bg-orange-900',  text: 'text-orange-400', border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
-                  cyan:   { bar: 'bg-cyan-900',    text: 'text-cyan-400',   border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
-                };
-                const c = colorMap[phase.color] || colorMap.blue;
-                const isEditing = editingPhaseId === phase.id;
-                const canEdit = !isSimulating && parsedEvents.length === 0;
-
-                return (
-                  <div key={phase.id} className={`p-2 border ${c.border} ${c.bg} group transition-all duration-200 ${isEditing ? 'ring-1 ring-orange-800/50' : ''}`}>
-                    {isEditing && canEdit ? (
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <input
-                            className="flex-1 bg-[#111] border border-[#333] px-2 py-1 text-[10px] uppercase text-white focus:outline-none focus:border-orange-800"
-                            value={phase.name}
-                            onChange={e => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, name: e.target.value } : p))}
-                            placeholder="Название"
-                          />
-                          <input
-                            className="w-16 bg-[#111] border border-[#333] px-2 py-1 text-[10px] uppercase text-white focus:outline-none focus:border-orange-800"
-                            value={phase.dayRange}
-                            onChange={e => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, dayRange: e.target.value } : p))}
-                            placeholder="D1-2"
-                          />
-                        </div>
-                        <textarea
-                          className="w-full bg-[#111] border border-[#333] px-2 py-1 text-[11px] text-[#A3A3A3] focus:outline-none focus:border-orange-800 resize-none leading-relaxed"
-                          rows={2}
-                          value={phase.description}
-                          onChange={e => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, description: e.target.value } : p))}
-                          placeholder="Описание симптомов..."
-                        />
-                        <div className="flex items-center justify-between">
-                          <div className="flex gap-1">
-                            {(['blue', 'yellow', 'red', 'green', 'purple', 'orange', 'cyan'] as const).map(clr => (
-                              <button
-                                key={clr}
-                                onClick={() => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, color: clr } : p))}
-                                className={`w-4 h-4 rounded-full border-2 transition-all ${
-                                  phase.color === clr ? 'border-white scale-125' : 'border-[#333] hover:border-[#555]'
-                                }`}
-                                style={{ backgroundColor: { blue: '#1e3a5f', yellow: '#5f4a1e', red: '#5f1e1e', green: '#1e5f3a', purple: '#3a1e5f', orange: '#5f3a1e', cyan: '#1e4a5f' }[clr] }}
-                              />
-                            ))}
-                          </div>
-                          <div className="flex gap-1">
-                            <button
-                              onClick={() => setSymptomPhases(prev => prev.filter(p => p.id !== phase.id))}
-                              className="p-1 text-red-900 hover:text-red-500 transition-colors"
-                              title="Удалить"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                            <button
-                              onClick={() => setEditingPhaseId(null)}
-                              className="p-1 text-green-900 hover:text-green-500 transition-colors"
-                              title="Готово"
-                            >
-                              <Check className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div
-                        className={`${canEdit ? 'cursor-pointer' : ''}`}
-                        onClick={() => canEdit && setEditingPhaseId(phase.id)}
-                      >
-                        <div className="flex items-center gap-2 mb-1">
-                          <div className={`w-1 h-3 ${c.bar}`}></div>
-                          <span className={`text-[10px] uppercase ${c.text} flex-1`}>{phase.name} ({phase.dayRange})</span>
-                          {canEdit && (
-                            <Pencil className="w-3 h-3 text-[#333] group-hover:text-[#666] transition-colors" />
-                          )}
-                        </div>
-                        <p className="text-[11px] leading-relaxed">{phase.description}</p>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              {symptomPhases.length === 0 && (
-                <p className="text-[10px] text-[#555] italic">Нет фаз. Нажмите + чтобы добавить.</p>
-              )}
-            </div>
-            </div>
           </div>
 
           <div className="p-4 bg-[#111] border-t border-[#333] shrink-0">
-             <div className="flex flex-col gap-2">
-               <label className="text-[10px] uppercase text-[#555]">Period Step</label>
-               <select 
-                 className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
-                 value={stepAmount}
-                 onChange={e => setStepAmount(e.target.value)}
-                 disabled={isSimulating}
-               >
-                 <option value="1 день">1 день</option>
-                 <option value="3 дня">3 дня</option>
-                 <option value="1 неделя">1 неделя</option>
-                 <option value="1 месяц">1 месяц</option>
-                 <option value="1 год">1 год</option>
-               </select>
-               <label className="text-[10px] uppercase text-[#555]">Event Frequency</label>
-               <select 
-                 className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
-                 value={eventFrequency}
-                 onChange={e => setEventFrequency(e.target.value)}
-                 disabled={isSimulating}
-               >
-                 <option value="30 минут">Каждые 30 минут</option>
-                 <option value="1 час">Каждый 1 час</option>
-                 <option value="3 часа">Каждые 3 часа</option>
-                 <option value="5 часов">Каждые 5 часов</option>
-               </select>
-               <button
-                 onClick={startSimulationStep}
-                 disabled={isSimulating}
-                 className="w-full mt-2 py-3 bg-red-950 border border-red-600 text-red-400 text-xs font-bold uppercase tracking-widest hover:bg-red-900 transition-colors disabled:opacity-50"
-               >
-                 {isSimulating ? "Симуляция..." : (parsedEvents.length > 0 ? "Advance Time" : "Initiate Leak")}
-               </button>
-             </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-[10px] uppercase text-[#555]">Period Step</label>
+              <select
+                className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
+                value={stepAmount}
+                onChange={(e) => setStepAmount(e.target.value)}
+                disabled={isSimulating}
+              >
+                <option value="1 день">1 день</option>
+                <option value="3 дня">3 дня</option>
+                <option value="1 неделя">1 неделя</option>
+                <option value="1 месяц">1 месяц</option>
+                <option value="1 год">1 год</option>
+              </select>
+              <label className="text-[10px] uppercase text-[#555]">Event Frequency</label>
+              <select
+                className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
+                value={eventFrequency}
+                onChange={(e) => setEventFrequency(e.target.value)}
+                disabled={isSimulating}
+              >
+                <option value="30 минут">Каждые 30 минут</option>
+                <option value="1 час">Каждый 1 час</option>
+                <option value="3 часа">Каждые 3 часа</option>
+                <option value="5 часов">Каждые 5 часов</option>
+              </select>
+              <button
+                onClick={startSimulationStep}
+                disabled={isSimulating}
+                className="w-full mt-2 py-3 bg-red-950 border border-red-600 text-red-400 text-xs font-bold uppercase tracking-widest hover:bg-red-900 transition-colors disabled:opacity-50"
+              >
+                {isSimulating ? 'Симуляция...' : parsedEvents.length > 0 ? 'Advance Time' : 'Initiate Leak'}
+              </button>
+            </div>
           </div>
         </aside>
 
@@ -752,7 +766,7 @@ export default function App() {
                  <div className="flex flex-col w-full">
                    <span className="text-[9px] uppercase text-[#777] mb-1 tracking-wider">{parsedEvents[selectedDayIndex].dateStr}</span>
                    <div className="markdown-body whitespace-pre-wrap prose prose-invert prose-p:my-1 prose-sm max-w-none text-[11px] leading-relaxed text-[#E0E0E0]">
-                     <ReactMarkdown>{parsedEvents[selectedDayIndex].text}</ReactMarkdown>
+                     <ReactMarkdown>{displayTimelineText}</ReactMarkdown>
                    </div>
                  </div>
               </div>
@@ -777,11 +791,25 @@ export default function App() {
         )}
       </main>
 
-      <footer className="h-8 border-t border-[#333] hidden md:flex items-center justify-between px-4 bg-[#0A0A0A] text-[9px] uppercase tracking-tighter shrink-0">
-        <div className="flex gap-6">
-          <span>User: {currentUsername.toUpperCase()}</span>
-          <span>Security: LEVEL 5</span>
-          <span className="text-green-800">Link: SECURE_128-BIT</span>
+      <footer className="min-h-12 border-t border-[#333] flex items-center justify-between gap-3 px-2 md:px-4 bg-[#0A0A0A] text-[9px] uppercase tracking-tighter shrink-0">
+        <div className="flex min-w-0 items-center gap-3 md:gap-6">
+          <button
+            onClick={() => {
+              setDiseaseTab('overview');
+              setIsDiseaseWindowOpen(true);
+            }}
+            className="disease-hud-button"
+            aria-label="Открыть окно болезни"
+          >
+            <span className="disease-hud-title">Мутации</span>
+            <span className="disease-hud-value">
+              <Dna className="h-5 w-5" strokeWidth={1.7} />
+              <span>{mutationPoints}</span>
+            </span>
+          </button>
+          <span className="hidden md:inline">User: {currentUsername.toUpperCase()}</span>
+          <span className="hidden md:inline">Security: LEVEL 5</span>
+          <span className="hidden lg:inline text-green-800">Link: SECURE_128-BIT</span>
           <button 
             onClick={handleLogout}
             className="flex items-center gap-1 text-[#555] hover:text-red-500 transition-colors cursor-pointer"
@@ -790,7 +818,7 @@ export default function App() {
             <span>Выход</span>
           </button>
         </div>
-        <div className="flex gap-4">
+        <div className="hidden lg:flex gap-4">
           <span className="text-red-900 font-bold">SIMULATION IS FOR MILITARY PURPOSES ONLY</span>
         </div>
       </footer>
@@ -954,6 +982,342 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Disease Management Modal */}
+      {isDiseaseWindowOpen && (
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/90 backdrop-blur-md p-4">
+          <div className="bg-[#0A0A0A] border border-red-900/50 w-full max-w-4xl h-[85vh] flex flex-col shadow-[0_0_100px_rgba(255,0,0,0.15)] relative overflow-hidden">
+            <div className="absolute inset-0 opacity-5 pointer-events-none" style={{ backgroundImage: 'radial-gradient(#ff0000 1px, transparent 1px)', backgroundSize: '30px 30px' }}></div>
+            
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 border-b border-[#333] bg-[#0d0d0d] relative z-10">
+              <div className="flex items-center gap-3">
+                <Biohazard className="w-6 h-6 text-red-600 animate-pulse" />
+                <h2 className="text-lg font-bold text-white uppercase tracking-tighter">Управление Вирусом</h2>
+              </div>
+              <button 
+                onClick={() => setIsDiseaseWindowOpen(false)}
+                className="text-[#555] hover:text-white transition-colors"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            {/* Tabs */}
+            <div className="flex border-b border-[#333] bg-[#080808] relative z-10">
+              <button 
+                onClick={() => setDiseaseTab('overview')}
+                className={`px-6 py-4 text-xs font-bold uppercase tracking-widest transition-all flex items-center gap-2 ${diseaseTab === 'overview' ? 'bg-[#1a0505] text-red-500 border-b-2 border-red-600' : 'text-[#555] hover:text-[#A3A3A3]'}`}
+              >
+                <Dna className="w-4 h-4" />
+                Обзор и Мутация
+              </button>
+              <button 
+                onClick={() => setDiseaseTab('phases')}
+                className={`px-6 py-4 text-xs font-bold uppercase tracking-widest transition-all flex items-center gap-2 ${diseaseTab === 'phases' ? 'bg-[#1a0505] text-red-500 border-b-2 border-red-600' : 'text-[#555] hover:text-[#A3A3A3]'}`}
+              >
+                <Microscope className="w-4 h-4" />
+                Фазы Вируса
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto p-6 bg-[#050505] relative z-10">
+              {diseaseTab === 'overview' ? (
+                <div className="space-y-8">
+                  {/* MP Display */}
+                  <div className="flex items-center justify-between bg-[#0A0A0A] border border-red-900/30 p-4 rounded shadow-inner">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 bg-red-950/40 rounded border border-red-900/50">
+                        <Dna className="w-6 h-6 text-red-500" />
+                      </div>
+                      <div>
+                        <p className="text-[10px] uppercase text-[#555] tracking-widest">Доступно очков мутации</p>
+                        <p className="text-2xl font-bold text-white tracking-tighter">{mutationPoints} ОМ</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                       <p className="text-[10px] uppercase text-[#555] tracking-widest">Активных мутаций</p>
+                       <p className="text-xl font-bold text-red-500">{activeMutations.length}</p>
+                    </div>
+                  </div>
+
+                  {/* Proposal Input */}
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between border-b border-[#222] pb-2">
+                       <h3 className="text-sm font-bold text-white uppercase tracking-widest">Новая Мутация</h3>
+                       <span className="text-[9px] text-[#555] uppercase">Опишите желаемое изменение вируса</span>
+                    </div>
+                    
+                    <div className="relative">
+                      <textarea
+                        className="w-full bg-[#080808] border border-[#222] p-4 text-sm text-[#E0E0E0] focus:outline-none focus:border-red-900/50 transition-colors min-h-[120px] resize-none"
+                        placeholder="Например: Зомби становятся устойчивы к холоду и могут действовать в арктических условиях..."
+                        value={mutationProposal}
+                        onChange={(e) => setMutationProposal(e.target.value)}
+                        disabled={isEvaluating}
+                      />
+                      {isEvaluating && (
+                        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center text-red-500 gap-2">
+                           <Loader2 className="w-6 h-6 animate-spin" />
+                           <span className="text-[10px] uppercase tracking-widest">Гейм-Мастер оценивает предложение...</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex justify-end gap-3">
+                      {evaluationResult && (
+                        <button
+                          onClick={() => setEvaluationResult(null)}
+                          className="px-4 py-2 text-[10px] uppercase font-bold text-[#555] hover:text-white transition-colors"
+                        >
+                          Сброс
+                        </button>
+                      )}
+                      <button
+                        onClick={handleEvaluateMutation}
+                        disabled={isEvaluating || !mutationProposal.trim()}
+                        className="px-6 py-2 bg-red-950/30 border border-red-900/50 text-red-500 text-[10px] uppercase font-bold hover:bg-red-900/50 transition-colors disabled:opacity-30"
+                      >
+                        Оценить стоимость
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Evaluation Result */}
+                  {evaluationResult && (
+                    <div className={`p-6 border ${evaluationResult.approved ? 'border-green-900/50 bg-green-950/10' : 'border-red-900/50 bg-red-950/10'} rounded animate-in fade-in slide-in-from-top-4`}>
+                      <div className="flex items-start justify-between mb-4">
+                        <div>
+                          <p className="text-[10px] uppercase text-[#555] tracking-widest mb-1">Вердикт Мастера</p>
+                          <h4 className={`text-lg font-bold uppercase ${evaluationResult.approved ? 'text-green-500' : 'text-red-500'}`}>
+                            {evaluationResult.approved ? evaluationResult.name : 'Отклонено'}
+                          </h4>
+                        </div>
+                        {evaluationResult.approved && (
+                          <div className="text-right">
+                            <p className="text-[10px] uppercase text-[#555] tracking-widest mb-1">Стоимость</p>
+                            <p className="text-xl font-bold text-white">{evaluationResult.cost} ОМ</p>
+                          </div>
+                        )}
+                      </div>
+                      <p className="text-xs italic leading-relaxed text-[#A3A3A3] mb-6">"{evaluationResult.reason}"</p>
+                      
+                      {evaluationResult.approved && (
+                        <button
+                          onClick={handleApplyMutation}
+                          disabled={mutationPoints < evaluationResult.cost}
+                          className="w-full py-3 bg-green-600 text-white text-xs font-bold uppercase tracking-widest hover:bg-green-500 transition-colors disabled:opacity-30 disabled:grayscale shadow-[0_0_20px_rgba(34,197,94,0.2)]"
+                        >
+                          {mutationPoints < evaluationResult.cost ? 'Недостаточно очков' : 'Внедрить мутацию в геном'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Active Mutations List */}
+                  <div className="space-y-4 pt-4 border-t border-[#222]">
+                    <h3 className="text-sm font-bold text-white uppercase tracking-widest">Активные мутации</h3>
+                    {activeMutations.length === 0 ? (
+                      <div className="py-8 flex flex-col items-center justify-center border border-dashed border-[#222] opacity-30">
+                        <Dna className="w-8 h-8 mb-2" />
+                        <p className="text-[10px] uppercase tracking-widest">Геном стабилен. Мутаций нет.</p>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {activeMutations.map((m) => (
+                          <div key={m.id} className="p-4 bg-[#0A0A0A] border border-red-900/20 rounded group hover:border-red-900/50 transition-colors relative">
+                            <button
+                              onClick={() => handleRemoveMutation(m.id)}
+                              className="absolute top-3 right-3 p-1.5 text-[#333] hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                              title="Откатить мутацию"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                            </button>
+                            <div className="flex items-center justify-between mb-2 pr-6">
+                              <span className="text-xs font-bold text-red-500 uppercase">{m.name}</span>
+                              <span className="text-[9px] text-[#555] uppercase">День {m.dayApplied}</span>
+                            </div>
+                            <p className="text-[11px] leading-relaxed text-[#888]">{m.description}</p>
+                            <div className="mt-2 text-[9px] text-red-900/60 uppercase font-bold">Возврат: {m.cost} ОМ</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <div className="flex items-center justify-between border-b border-[#222] pb-4">
+                    <div>
+                      <h3 className="text-sm font-bold text-white uppercase tracking-widest">Матрица Симптомов</h3>
+                      <p className="text-[10px] text-[#555] uppercase mt-1">Определение этапов развития патогена</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          const newId = `phase_${Date.now()}`;
+                          setSymptomPhases(prev => [...prev, { id: newId, name: `Phase ${prev.length + 1}`, dayRange: 'D?', description: 'Описание фазы...', color: 'green' }]);
+                          setEditingPhaseId(newId);
+                        }}
+                        disabled={isSimulating || parsedEvents.length > 0}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-green-950/30 border border-green-900/50 text-green-500 text-[10px] uppercase font-bold hover:bg-green-900/50 transition-colors disabled:opacity-30"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Добавить фазу
+                      </button>
+                      <button
+                        onClick={() => { setSymptomPhases(DEFAULT_SYMPTOM_PHASES); setEditingPhaseId(null); }}
+                        disabled={isSimulating || parsedEvents.length > 0}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-orange-950/30 border border-orange-900/50 text-orange-500 text-[10px] uppercase font-bold hover:bg-orange-900/50 transition-colors disabled:opacity-30"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        Сброс
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {symptomPhases.map((phase) => {
+                      const colorMap: Record<string, { bar: string; text: string; border: string; bg: string }> = {
+                        blue:   { bar: 'bg-blue-900',   text: 'text-blue-400',   border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
+                        yellow: { bar: 'bg-yellow-900',  text: 'text-yellow-500', border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
+                        red:    { bar: 'bg-red-600',     text: 'text-red-500',    border: 'border-red-900',   bg: 'bg-[#120505]' },
+                        green:  { bar: 'bg-green-900',   text: 'text-green-400',  border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
+                        purple: { bar: 'bg-purple-900',  text: 'text-purple-400', border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
+                        orange: { bar: 'bg-orange-900',  text: 'text-orange-400', border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
+                        cyan:   { bar: 'bg-cyan-900',    text: 'text-cyan-400',   border: 'border-[#222]',    bg: 'bg-[#0A0A0A]' },
+                      };
+                      const c = colorMap[phase.color] || colorMap.blue;
+                      const isEditing = editingPhaseId === phase.id;
+                      const canEdit = !isSimulating && parsedEvents.length === 0;
+
+                      return (
+                        <div key={phase.id} className={`p-4 border ${c.border} ${c.bg} group transition-all duration-200 ${isEditing ? 'ring-1 ring-orange-800/50' : ''} relative`}>
+                          {isEditing && canEdit ? (
+                            <div className="space-y-3">
+                              <div className="flex items-center gap-2">
+                                <input
+                                  className="flex-1 bg-[#111] border border-[#333] px-3 py-2 text-xs uppercase text-white focus:outline-none focus:border-orange-800"
+                                  value={phase.name}
+                                  onChange={e => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, name: e.target.value } : p))}
+                                  placeholder="Название"
+                                />
+                                <input
+                                  className="w-20 bg-[#111] border border-[#333] px-3 py-2 text-xs uppercase text-white focus:outline-none focus:border-orange-800"
+                                  value={phase.dayRange}
+                                  onChange={e => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, dayRange: e.target.value } : p))}
+                                  placeholder="D1-2"
+                                />
+                              </div>
+                              <textarea
+                                className="w-full bg-[#111] border border-[#333] px-3 py-2 text-[12px] text-[#A3A3A3] focus:outline-none focus:border-orange-800 resize-none leading-relaxed"
+                                rows={3}
+                                value={phase.description}
+                                onChange={e => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, description: e.target.value } : p))}
+                                placeholder="Описание симптомов..."
+                              />
+                              <div className="flex items-center justify-between">
+                                <div className="flex gap-1.5">
+                                  {(['blue', 'yellow', 'red', 'green', 'purple', 'orange', 'cyan'] as const).map(clr => (
+                                    <button
+                                      key={clr}
+                                      onClick={() => setSymptomPhases(prev => prev.map(p => p.id === phase.id ? { ...p, color: clr } : p))}
+                                      className={`w-5 h-5 rounded-full border-2 transition-all ${
+                                        phase.color === clr ? 'border-white scale-110' : 'border-[#333] hover:border-[#555]'
+                                      }`}
+                                      style={{ backgroundColor: { blue: '#1e3a5f', yellow: '#5f4a1e', red: '#5f1e1e', green: '#1e5f3a', purple: '#3a1e5f', orange: '#5f3a1e', cyan: '#1e4a5f' }[clr] }}
+                                    />
+                                  ))}
+                                </div>
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() => setSymptomPhases(prev => prev.filter(p => p.id !== phase.id))}
+                                    className="p-1.5 text-red-900 hover:text-red-500 transition-colors"
+                                    title="Удалить"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                  <button
+                                    onClick={() => setEditingPhaseId(null)}
+                                    className="p-1.5 text-green-900 hover:text-green-500 transition-colors"
+                                    title="Готово"
+                                  >
+                                    <Check className="w-5 h-5" />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <div
+                              className={`${canEdit ? 'cursor-pointer' : ''}`}
+                              onClick={() => canEdit && setEditingPhaseId(phase.id)}
+                            >
+                              <div className="flex items-center gap-3 mb-2">
+                                <div className={`w-1 h-4 ${c.bar}`}></div>
+                                <span className={`text-xs font-bold uppercase ${c.text} flex-1`}>{phase.name} ({phase.dayRange})</span>
+                                {canEdit && (
+                                  <Pencil className="w-3.5 h-3.5 text-[#333] group-hover:text-[#666] transition-colors" />
+                                )}
+                              </div>
+                              <p className="text-xs leading-relaxed text-[#A3A3A3]">{phase.description}</p>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {symptomPhases.length === 0 && (
+                    <div className="flex flex-col items-center justify-center py-12 border border-dashed border-[#222]">
+                      <p className="text-xs text-[#555] italic uppercase tracking-widest">Фазы не определены</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            
+            {/* Footer decoration */}
+            <div className="h-1 bg-red-900/20 w-full">
+              <div className="h-full bg-red-600 w-1/3"></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Notifications */}
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[3000] flex flex-col gap-2 pointer-events-none w-full max-w-md px-4">
+        {notifications.map(n => (
+          <div 
+            key={n.id} 
+            className={`pointer-events-auto flex items-start gap-4 p-4 rounded-sm border shadow-2xl notification-animate min-w-[320px] ${
+              n.type === 'error' ? 'bg-red-950/95 border-red-500 text-red-100 shadow-red-900/40' : 
+              n.type === 'warning' ? 'bg-orange-950/95 border-orange-500 text-orange-100 shadow-orange-900/40' : 
+              'bg-[#0A0A0A]/95 border-blue-600 text-blue-100 shadow-blue-900/40'
+            }`}
+          >
+            <div className={`p-2 rounded ${
+              n.type === 'error' ? 'bg-red-900/30 text-red-500' : 
+              n.type === 'warning' ? 'bg-orange-900/30 text-orange-500' : 
+              'bg-blue-900/30 text-blue-500'
+            }`}>
+              {n.type === 'error' ? <Skull className="w-5 h-5" /> : 
+               n.type === 'warning' ? <Biohazard className="w-5 h-5" /> : 
+               <Microscope className="w-5 h-5" />}
+            </div>
+            <div className="flex-1 min-w-0 pt-0.5">
+               <div className="flex items-center justify-between mb-1">
+                 <span className={`text-[9px] uppercase font-black tracking-[0.25em] ${
+                   n.type === 'error' ? 'text-red-500' : n.type === 'warning' ? 'text-orange-500' : 'text-blue-500'
+                 }`}>
+                   {n.type === 'error' ? 'Critical Error' : n.type === 'warning' ? 'System Alert' : 'Simulation Update'}
+                 </span>
+                 <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></div>
+               </div>
+               <p className="text-[11px] font-bold uppercase tracking-tight leading-snug opacity-90">{n.message}</p>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
