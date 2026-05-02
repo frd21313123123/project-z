@@ -1,0 +1,6 @@
+{
+  "name": "Project Z-Simulator",
+  "description": "An AI-powered Zombie Outbreak Simulator that tracks the spread of a military pathogen across the globe on an interactive map.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
