@@ -408,6 +408,16 @@ export default function App() {
     setEvaluationResult(null);
   };
 
+  const handleRemoveMutation = (id: string) => {
+    const mutation = activeMutations.find(m => m.id === id);
+    if (!mutation) return;
+
+    if (window.confirm(`Вы уверены, что хотите откатить мутацию "${mutation.name}"? Вам будет возвращено ${mutation.cost} ОМ.`)) {
+      setMutationPoints(prev => prev + mutation.cost);
+      setActiveMutations(prev => prev.filter(m => m.id !== id));
+    }
+  };
+
   if (!isAuthed) {
     return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
   }
@@ -1062,12 +1072,20 @@ export default function App() {
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {activeMutations.map((m) => (
-                          <div key={m.id} className="p-4 bg-[#0A0A0A] border border-red-900/20 rounded group hover:border-red-900/50 transition-colors">
-                            <div className="flex items-center justify-between mb-2">
+                          <div key={m.id} className="p-4 bg-[#0A0A0A] border border-red-900/20 rounded group hover:border-red-900/50 transition-colors relative">
+                            <button
+                              onClick={() => handleRemoveMutation(m.id)}
+                              className="absolute top-3 right-3 p-1.5 text-[#333] hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                              title="Откатить мутацию"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                            </button>
+                            <div className="flex items-center justify-between mb-2 pr-6">
                               <span className="text-xs font-bold text-red-500 uppercase">{m.name}</span>
                               <span className="text-[9px] text-[#555] uppercase">День {m.dayApplied}</span>
                             </div>
                             <p className="text-[11px] leading-relaxed text-[#888]">{m.description}</p>
+                            <div className="mt-2 text-[9px] text-red-900/60 uppercase font-bold">Возврат: {m.cost} ОМ</div>
                           </div>
                         ))}
                       </div>
