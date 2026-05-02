@@ -16,6 +16,12 @@ interface TimelineEvent {
   mapData?: any;
 }
 
+interface Notification {
+  id: string;
+  message: string;
+  type: 'info' | 'error' | 'warning';
+}
+
 const emptyMapData = () => ({ infected: [], movements: [], pois: [], perimeters: [], stats: { infected: 0, zombies: 0 } });
 
 const normalizeMapData = (mapData: any) => ({
@@ -43,7 +49,7 @@ const getZombieCount = (mapData: any) => {
 
 const formatCounter = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
 
-const DAY_HEADER_REGEX = /(?:^|\n)[ \t]*(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\(([^)\n]+)\))?[ \t]*(?:\*\*)?[ \t]*(?::)?[ \t]*(?:\*\*)?/g;
+const DAY_HEADER_REGEX = /(?:^|\n|[ \t]|[\.\!\?])(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\(([^)\n]+)\))?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*/g;
 
 const buildMapDataSnapshot = (events: TimelineEvent[], lastIndex: number, snapshots: Record<number, any>) => {
   if (!events.length || lastIndex < 0) return emptyMapData();
@@ -139,8 +145,8 @@ export default function App() {
   const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({});
   const [isSimulating, setIsSimulating] = useState(false);
   const [isImageGenerating, setIsImageGenerating] = useState(false);
-  const [stepAmount, setStepAmount] = useState('1 неделя');
-  const [eventFrequency, setEventFrequency] = useState('30 минут');
+  const [stepAmount, setStepAmount] = useState('3 дня');
+  const [eventFrequency, setEventFrequency] = useState('3 часа');
   const [images, setImages] = useState<Record<number, string>>({});
   const [imagePrompts, setImagePrompts] = useState<Record<number, string>>({});
   const [mainView, setMainView] = useState<'split' | 'map' | 'chat'>('split');
@@ -165,6 +171,15 @@ export default function App() {
 
   const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+
+  const addNotification = useCallback((message: string, type: Notification['type'] = 'info') => {
+    const id = Math.random().toString(36).substring(2, 9);
+    setNotifications(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== id));
+    }, 5000);
+  }, []);
 
   // Auto-save settings whenever they change
   useEffect(() => {
@@ -182,10 +197,9 @@ export default function App() {
 
   const parsedEvents = useMemo(() => {
     const events: TimelineEvent[] = [];
-    // Match DAY_X headers with optional dates and markdown wrappers.
-    // The model occasionally omits "(Date)", and the map/day split must still stay correct.
     const headerRegex = new RegExp(DAY_HEADER_REGEX);
     
+    // Find all matches for DAY_X
     const matches = Array.from(timeline.matchAll(headerRegex));
 
     for (let i = 0; i < matches.length; i++) {
@@ -193,12 +207,13 @@ export default function App() {
       const dayNum = parseInt(match[1], 10);
       const dateStr = match[2] || `DAY_${dayNum}`;
       
-      const startIndex = match.index + match[0].length;
-      const endIndex = i + 1 < matches.length ? matches[i + 1].index : timeline.length;
+      const headerStartIndex = match.index;
+      const nextMatchIndex = i + 1 < matches.length ? matches[i + 1].index : timeline.length;
       
-      let rawText = timeline.substring(startIndex, endIndex).trim();
+      // The text of this day starts after its header and ends before the next day's header
+      let rawText = timeline.substring(headerStartIndex + match[0].length, nextMatchIndex).trim();
 
-      // Process MAP_DATA
+      // Process MAP_DATA if it exists within this day's block
       let mapData = undefined;
       const mapStartIndex = rawText.indexOf('[MAP_DATA:');
       if (mapStartIndex !== -1) {
@@ -215,9 +230,10 @@ export default function App() {
             const jsonStr = rawText.substring(jsonStart, jsonEnd + 1);
             try {
               mapData = JSON.parse(jsonStr);
+              // Clean up the text by removing the technical block
               rawText = rawText.substring(0, mapStartIndex).trim() + '\n' + rawText.substring(mapEndIndex + 1).trim();
             } catch (e) {
-              // silently ignore parse errors during streaming
+              // Ignore parse errors
             }
           }
         }
@@ -232,8 +248,7 @@ export default function App() {
       });
     }
 
-    // Use a Map to naturally deduplicate and keep the LAST occurrence.
-    // This allows us to overwrite accidental early generations with their proper, detailed iterations.
+    // Deduplicate: keep the last version of each day (important for streaming)
     const latestEventsMap = new Map<number, TimelineEvent>();
     for (const ev of events) {
       latestEventsMap.set(ev.day, ev);
@@ -250,6 +265,9 @@ export default function App() {
   useEffect(() => {
     if (parsedEvents.length > 0 && selectedDayIndex === -1) {
       setSelectedDayIndex(0);
+    } else if (isSimulating && parsedEvents.length > 0) {
+      // During simulation, always follow the latest day being generated
+      setSelectedDayIndex(parsedEvents.length - 1);
     } else if (!isSimulating && parsedEvents.length > 0 && selectedDayIndex === parsedEvents.length - 2) {
       // Auto-advance to the newly generated day only when generation completes, 
       // and only if the user was on the previous day (meaning they were following along).
@@ -266,8 +284,27 @@ export default function App() {
     }
     
     // Determine current elapsed context
-    const elapsedDays = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].day : 0;
-    const currentParsedDateStr = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].dateStr : startDate;
+    const lastEvent = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1] : null;
+    const elapsedDays = lastEvent ? lastEvent.day : 0;
+    
+    // Calculate the date for the next day
+    let nextDateStr = startDate;
+    if (lastEvent) {
+        try {
+            const lastDate = new Date(lastEvent.dateStr);
+            if (!isNaN(lastDate.getTime())) {
+                const nextDate = new Date(lastDate);
+                nextDate.setDate(nextDate.getDate() + 1);
+                nextDateStr = nextDate.toISOString().split('T')[0];
+            } else {
+                // Fallback to day count if date parsing fails
+                nextDateStr = `День ${elapsedDays + 1}`;
+            }
+        } catch (e) {
+            nextDateStr = `День ${elapsedDays + 1}`;
+        }
+    }
+
     const latestMapData = buildMapDataSnapshot(parsedEvents, parsedEvents.length - 1, mapSnapshots);
 
     try {
@@ -279,7 +316,7 @@ export default function App() {
         startDate,
         scenario: `[Предисловие]: ${activeScenario.preface}\n[Начало/Причина]: ${activeScenario.origin}\n[Симптомы/Особенности]: ${activeScenario.symptoms}`,
         symptomDescription: symptomDesc,
-        currentDate: currentParsedDateStr,
+        currentDate: nextDateStr,
         elapsedDays,
         stepAmount,
         eventFrequency,
@@ -289,6 +326,7 @@ export default function App() {
         onMapData: (day: number, mapData: any) => {
           setMapSnapshots(prev => ({ ...prev, [day]: normalizeMapData(mapData) }));
         },
+        onNotification: addNotification,
         textModel,
         textProvider,
         openAiKey,
@@ -297,7 +335,17 @@ export default function App() {
 
       let newTimelineChunk = "";
       for await (const chunk of stream) {
-        setTimeline(prev => prev + chunk);
+        setTimeline(prev => {
+          const updated = prev + chunk;
+          // Check if a new DAY_ header was just added
+          const headerRegex = new RegExp(DAY_HEADER_REGEX);
+          const matches = Array.from(updated.matchAll(headerRegex));
+          if (matches.length > 0) {
+            // If the number of days increased, we might want to switch view
+            // (Note: parsedEvents is updated via useMemo, but we can trigger state change here)
+          }
+          return updated;
+        });
         newTimelineChunk += chunk;
       }
 
@@ -317,7 +365,7 @@ export default function App() {
                  setImages(prev => ({...prev, [lastDayInChunk]: imgBase64}));
               } catch (e: any) {
                  console.error("Image generation failed", e);
-                 setTimeline(prev => prev + '\\n\\n*[Системное предупреждение: не удалось получить визуализацию с дрона: ' + e.message + ']*');
+                 addNotification(`Системное предупреждение: не удалось получить визуализацию с дрона: ${e.message}`, 'warning');
               } finally {
                  setIsImageGenerating(false);
               }
@@ -338,7 +386,7 @@ export default function App() {
       }
 
     } catch (e: any) {
-      setTimeline(prev => prev + '\n\n**[СИСТЕМНАЯ ОШИБКА]** ' + e.message);
+      addNotification(`СИСТЕМНАЯ ОШИБКА: ${e.message}`, 'error');
     } finally {
       setIsSimulating(false);
     }
@@ -360,6 +408,12 @@ export default function App() {
   }), [currentDayMapData]);
 
   const currentEvent = parsedEvents[selectedDayIndex];
+
+  const displayTimelineText = useMemo(() => {
+    if (!currentEvent) return '';
+    // Extra safety to strip technical blocks that might have leaked into currentEvent.text
+    return currentEvent.text.replace(/\[MAP_DATA:[\s\S]*?\]/g, "").trim();
+  }, [currentEvent]);
 
   const handleEvaluateMutation = async () => {
     if (!mutationProposal.trim()) return;
@@ -712,7 +766,7 @@ export default function App() {
                  <div className="flex flex-col w-full">
                    <span className="text-[9px] uppercase text-[#777] mb-1 tracking-wider">{parsedEvents[selectedDayIndex].dateStr}</span>
                    <div className="markdown-body whitespace-pre-wrap prose prose-invert prose-p:my-1 prose-sm max-w-none text-[11px] leading-relaxed text-[#E0E0E0]">
-                     <ReactMarkdown>{parsedEvents[selectedDayIndex].text}</ReactMarkdown>
+                     <ReactMarkdown>{displayTimelineText}</ReactMarkdown>
                    </div>
                  </div>
               </div>
@@ -1229,6 +1283,41 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Notifications */}
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[3000] flex flex-col gap-2 pointer-events-none w-full max-w-md px-4">
+        {notifications.map(n => (
+          <div 
+            key={n.id} 
+            className={`pointer-events-auto flex items-start gap-4 p-4 rounded-sm border shadow-2xl notification-animate min-w-[320px] ${
+              n.type === 'error' ? 'bg-red-950/95 border-red-500 text-red-100 shadow-red-900/40' : 
+              n.type === 'warning' ? 'bg-orange-950/95 border-orange-500 text-orange-100 shadow-orange-900/40' : 
+              'bg-[#0A0A0A]/95 border-blue-600 text-blue-100 shadow-blue-900/40'
+            }`}
+          >
+            <div className={`p-2 rounded ${
+              n.type === 'error' ? 'bg-red-900/30 text-red-500' : 
+              n.type === 'warning' ? 'bg-orange-900/30 text-orange-500' : 
+              'bg-blue-900/30 text-blue-500'
+            }`}>
+              {n.type === 'error' ? <Skull className="w-5 h-5" /> : 
+               n.type === 'warning' ? <Biohazard className="w-5 h-5" /> : 
+               <Microscope className="w-5 h-5" />}
+            </div>
+            <div className="flex-1 min-w-0 pt-0.5">
+               <div className="flex items-center justify-between mb-1">
+                 <span className={`text-[9px] uppercase font-black tracking-[0.25em] ${
+                   n.type === 'error' ? 'text-red-500' : n.type === 'warning' ? 'text-orange-500' : 'text-blue-500'
+                 }`}>
+                   {n.type === 'error' ? 'Critical Error' : n.type === 'warning' ? 'System Alert' : 'Simulation Update'}
+                 </span>
+                 <div className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></div>
+               </div>
+               <p className="text-[11px] font-bold uppercase tracking-tight leading-snug opacity-90">{n.message}</p>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

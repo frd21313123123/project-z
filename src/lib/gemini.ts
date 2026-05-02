@@ -76,7 +76,7 @@ const mergeMapData = (base: any, delta: any) => {
     };
 };
 
-const DAY_HEADER_REGEX = /(?:^|\n)[ \t]*(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\([^)\n]+\))?[ \t]*(?:\*\*)?[ \t]*(?::)?[ \t]*(?:\*\*)?/g;
+const DAY_HEADER_REGEX = /(?:^|\n|[ \t]|[\.\!\?])(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\([^)\n]+\))?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*/g;
 
 const getDayHeaderMatches = (text: string) => Array.from(text.matchAll(DAY_HEADER_REGEX));
 
@@ -103,6 +103,11 @@ ${safeStringify(normalizeMapData(currentMapData))}
 
 Master strategic plan:
 ${masterContext?.masterPlan || 'No master plan available.'}
+
+Active viral mutations:
+${params.activeMutations?.length > 0 
+    ? params.activeMutations.map((m: any) => `- ${m.name}: ${m.description}`).join('\n')
+    : 'No active mutations.'}
 
 Geographic and terrain context:
 ${params.terrainContext || `Origin coordinates: ${params.location}. Terrain lookup was not available.`}
@@ -303,6 +308,7 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
     const apiKey = params.textProvider === 'openrouter' ? params.openRouterKey : params.openAiKey;
     const providerName = params.textProvider === 'openrouter' ? "OpenRouter" : "OpenAI";
     const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName };
+    const onNotification = params.onNotification;
     let daysToSimulate = 1;
     let daysPerGeneration = 1;
     let totalGenerations = 1;
@@ -348,7 +354,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
 Составь стратегический план развития на ${daysToSimulate} дней (с дня ${params.elapsedDays + 1} до ${params.elapsedDays + daysToSimulate}). 
 Опиши, какие основные события/фазы должны произойти за это время. Отвечай только планом.`;
 
-    yield `\n**[МАСТЕР СИМУЛЯЦИИ]** Выполняется расчет макро-стратегии на ${params.stepAmount}...\n\n`;
+    onNotification?.(`МАСТЕР СИМУЛЯЦИИ: расчет макро-стратегии на ${params.stepAmount}...`, 'info');
 
     let masterPlan = "План не сгенерирован.";
 
@@ -380,7 +386,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
         masterPlan = masterResponse.candidates?.[0]?.content?.parts?.[0]?.text || "План не сгенерирован.";
     }
 
-    yield `**[ПЛАН УТВЕРЖДЕН]** Запуск серии генераций для детализации событий (Итераций: ${totalGenerations})...\n\n`;
+    onNotification?.(`ПЛАН УТВЕРЖДЕН: запуск ${totalGenerations} итераций детализации.`, 'info');
 
     let fullTimelineContext = stripMapDataBlocks(params.previousTimeline || "");
     let fullSimulationTimelineForMaster = fullTimelineContext;
@@ -408,10 +414,14 @@ ${params.terrainContext || 'Контекст местности недоступ
 ПОЛНЫЙ КОНТЕКСТ УЖЕ СГЕНЕРИРОВАННЫХ ДНЕЙ:
 ${fullTimelineContext || 'Ранее событий нет.'}
 
-Твоя задача: расписать ${daysInstruction}
+Твоя задача: расписать ${daysInstruction}. 
+Текущая дата для Дня ${startDayIndex}: ${params.currentDate}.
 
 КРИТИЧЕСКИЕ ПРАВИЛА ФОРМАТА:
-1. Для КАЖДОГО дня твоего периода вывод ДОЛЖЕН СТРОГО начинаться со строки: DAY_{НОМЕР_ДНЯ} (Дата):
+1. Для КАЖДОГО дня твоего периода вывод ДОЛЖЕН СТРОГО начинаться С НОВОЙ СТРОКИ (лучше с двойного переноса строки) со строки: DAY_{НОМЕР_ДНЯ} (Дата):
+   Пример: 
+   
+   DAY_${startDayIndex} (${params.currentDate}):
 2. Далее по часам (формат ЧЧ:ММ). Частота генерации событий в течение дня: ${params.eventFrequency || 'на твое усмотрение'}. Генерируй события строго с этим интервалом (например, если указано "30 минут", то 08:00, 08:30, 09:00 и т.д.).
 3. НЕ выводи MAP_DATA, JSON или любые технические логи для карты. Всю информацию карты и счетчики после твоего текста рассчитывает только Мастер Симуляции.
 4. События должны учитывать реальную местность из контекста: если точка в пруду/озере/лесу/поле, люди, транспорт, клиники, базы и блокпосты должны появляться на ближайшей суше, дорогах, берегах, поселениях или подходящих объектах, а не в самой воде или пустой местности.
@@ -541,10 +551,8 @@ ${fullTimelineContext || 'Ранее событий нет.'}
             }
         } catch (e: any) {
             console.warn("Map state generation failed", e);
-            yield `\n\n*[Map state update failed: ${e.message || e}]*`;
+            onNotification?.(`Ошибка обновления карты: ${e.message || e}`, 'warning');
         }
-        
-        yield `\n\n`;
         
         if (totalGenerations > 1) {
             await new Promise(r => setTimeout(r, 1000));
