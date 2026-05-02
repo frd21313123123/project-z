@@ -23,19 +23,29 @@ const outbreakIcon = new L.Icon({
 });
 
 export interface MapData {
-  infected?: [number, number][];
+  infected?: ([number, number] | {
+    id?: string;
+    lat: number;
+    lng: number;
+    label?: string;
+    intensity?: number;
+  })[];
   movements?: {
+    id?: string;
     from: [number, number];
     to: [number, number];
     type: string;
+    label?: string;
   }[];
   pois?: {
+    id?: string;
     lat: number;
     lng: number;
     type: string;
     label?: string;
   }[];
   perimeters?: {
+    id?: string;
     points: [number, number][];
     type: string;
     label?: string;
@@ -47,16 +57,19 @@ interface MapViewProps {
   setLocation: (loc: [number, number]) => void;
   mapData?: MapData;
   showOverlay?: boolean;
+  isLocked?: boolean;
 }
 
-function LocationMarker({ location, setLocation }: MapViewProps) {
+function LocationMarker({ location, setLocation, isLocked }: MapViewProps) {
   useMapEvents({
     click(e) {
-      setLocation([e.latlng.lat, e.latlng.lng]);
+      if (!isLocked) {
+        setLocation([e.latlng.lat, e.latlng.lng]);
+      }
     },
   });
 
-  return location ? (
+  return location && !isLocked ? (
     <Marker position={location} icon={outbreakIcon} />
   ) : null;
 }
@@ -119,7 +132,7 @@ const getPoiIcon = (type: string) => {
   });
 };
 
-export function MapView({ location, setLocation, mapData, showOverlay = true }: MapViewProps) {
+export function MapView({ location, setLocation, mapData, showOverlay = true, isLocked = false }: MapViewProps) {
   return (
     <div className="w-full h-full bg-zinc-900 border-r border-zinc-800 relative z-0">
       <MapContainer
@@ -132,19 +145,27 @@ export function MapView({ location, setLocation, mapData, showOverlay = true }: 
           attribution='&copy; <a href="https://carto.com/">CartoDB</a>'
           url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
         />
-        <LocationMarker location={location} setLocation={setLocation} />
+        <LocationMarker location={location} setLocation={setLocation} isLocked={isLocked} />
 
-        {showOverlay && mapData?.infected?.map((pos, idx) => (
-          <CircleMarker 
-            key={`inf-${idx}`} 
-            center={pos} 
-            radius={6} 
-            pathOptions={{ color: '#EF4444', fillColor: '#EF4444', fillOpacity: 0.4 }} 
-          >
-            <Tooltip>Заражение</Tooltip>
-          </CircleMarker>
-        ))}
+        {showOverlay && mapData?.infected?.map((item, idx) => {
+          const pos: [number, number] = Array.isArray(item) ? item : [item.lat, item.lng];
+          const label = Array.isArray(item) ? 'Заражение' : (item.label || 'Заражение');
+          const intensity = Array.isArray(item) ? 1 : (item.intensity ?? 1);
 
+          return (
+            <CircleMarker
+              key={`inf-${Array.isArray(item) ? idx : (item.id || idx)}`}
+              center={pos}
+              radius={Math.max(5, Math.min(14, 5 + intensity * 3))}
+              pathOptions={{ color: '#EF4444', fillColor: '#EF4444', fillOpacity: 0.4 }}
+            >
+              <Tooltip>{label}</Tooltip>
+            </CircleMarker>
+          );
+        })}
+
+        {/* Movements are hidden as per user request */}
+        {/* 
         {showOverlay && mapData?.movements?.map((mov, idx) => {
           const dy = mov.to[0] - mov.from[0];
           const dx = mov.to[1] - mov.from[1];
@@ -156,19 +177,20 @@ export function MapView({ location, setLocation, mapData, showOverlay = true }: 
           ];
           
           return (
-            <div key={`mov-${idx}`}>
+            <div key={`mov-${mov.id || idx}`}>
               <Polyline positions={[mov.from, mov.to]} pathOptions={{ color: '#EF4444', dashArray: '5, 5', weight: 2, opacity: 0.7 }} />
               <Marker position={midPoint} icon={getMovementIcon(mov.type)}>
-                <Tooltip direction="top">Транспорт: {mov.type}</Tooltip>
+                <Tooltip direction="top">{mov.label || `Транспорт: ${mov.type}`}</Tooltip>
               </Marker>
               <Marker position={mov.to} icon={getArrowIcon(angle)} />
             </div>
           );
         })}
+        */}
 
         {showOverlay && mapData?.pois?.map((poi, idx) => (
           <Marker 
-            key={`poi-${idx}`} 
+            key={`poi-${poi.id || idx}`} 
             position={[poi.lat, poi.lng]} 
             icon={getPoiIcon(poi.type)}
           >
@@ -178,7 +200,7 @@ export function MapView({ location, setLocation, mapData, showOverlay = true }: 
 
         {showOverlay && mapData?.perimeters?.map((perimeter, idx) => (
           <Polygon 
-            key={`perim-${idx}`} 
+            key={`perim-${perimeter.id || idx}`} 
             positions={perimeter.points} 
             pathOptions={{ color: '#10B981', fillColor: '#10B981', fillOpacity: 0.2, weight: 2, dashArray: '4, 4' }} 
           >
@@ -187,12 +209,14 @@ export function MapView({ location, setLocation, mapData, showOverlay = true }: 
         ))}
 
       </MapContainer>
-      <div className="absolute top-4 left-4 z-[1000] pointer-events-none">
-        <div className="bg-black/60 backdrop-blur-sm border border-red-900/50 text-red-500 font-mono text-xs uppercase px-3 py-1 rounded">
-          <span className="w-2 h-2 rounded-full bg-red-500 inline-block mr-2 animate-pulse"></span>
-          Система геолокации активна. Нажмите на карту для выбора очага поражения.
+      {!isLocked && (
+        <div className="absolute top-4 left-4 z-[1000] pointer-events-none">
+          <div className="bg-black/60 backdrop-blur-sm border border-red-900/50 text-red-500 font-mono text-xs uppercase px-3 py-1 rounded">
+            <span className="w-2 h-2 rounded-full bg-red-500 inline-block mr-2 animate-pulse"></span>
+            Система геолокации активна. Нажмите на карту для выбора очага поражения.
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

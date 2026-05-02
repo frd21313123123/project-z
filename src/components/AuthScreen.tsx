@@ -50,7 +50,7 @@ export function AuthScreen({ onAuthSuccess }: AuthScreenProps) {
         <div className="text-center mb-8">
           <div className="flex items-center justify-center gap-3 mb-4">
             <div className="w-3 h-3 rounded-full bg-red-600 animate-pulse"></div>
-            <h1 className="text-2xl font-bold tracking-tighter text-white uppercase">PROJECT: Z</h1>
+            <h1 className="text-2xl font-bold tracking-tighter text-white uppercase">PROJECT Z</h1>
             <div className="w-3 h-3 rounded-full bg-red-600 animate-pulse"></div>
           </div>
           <div className="text-[10px] text-[#555] uppercase tracking-[0.3em]">

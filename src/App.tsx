@@ -2,9 +2,11 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { MapView } from './components/MapView';
 import { AuthScreen } from './components/AuthScreen';
 import { simulateOutbreakStepStream, generateCityImage, buildCityImagePrompt } from './lib/gemini';
+import { buildTerrainContext } from './lib/geoContext';
 import { getSessionUsername, getUserSettings, saveUserSettings, logoutUser, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS } from './lib/auth';
 import ReactMarkdown from 'react-markdown';
-import { ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw } from 'lucide-react';
+import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, Play, UserRound, Skull } from 'lucide-react';
+import menuBackground from '../background.png';
 
 interface TimelineEvent {
   day: number;
@@ -14,9 +16,60 @@ interface TimelineEvent {
   mapData?: any;
 }
 
+const emptyMapData = () => ({ infected: [], movements: [], pois: [], perimeters: [], stats: { infected: 0, zombies: 0 } });
+
+const normalizeMapData = (mapData: any) => ({
+  infected: Array.isArray(mapData?.infected) ? mapData.infected : [],
+  movements: Array.isArray(mapData?.movements) ? mapData.movements : [],
+  pois: Array.isArray(mapData?.pois) ? mapData.pois : [],
+  perimeters: Array.isArray(mapData?.perimeters) ? mapData.perimeters : [],
+  stats: mapData?.stats,
+  counts: mapData?.counts,
+  totalInfected: mapData?.totalInfected,
+  totalZombies: mapData?.totalZombies
+});
+
+const getInfectionCount = (mapData: any) => {
+  const explicitCount = Number(mapData?.stats?.infected ?? mapData?.counts?.infected ?? mapData?.totalInfected);
+  if (Number.isFinite(explicitCount)) return Math.max(0, Math.round(explicitCount));
+  return 0;
+};
+
+const getZombieCount = (mapData: any) => {
+  const explicitCount = Number(mapData?.stats?.zombies ?? mapData?.counts?.zombies ?? mapData?.totalZombies);
+  if (Number.isFinite(explicitCount)) return Math.max(0, Math.round(explicitCount));
+  return 0;
+};
+
+const formatCounter = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
+
+const DAY_HEADER_REGEX = /(?:^|\n)[ \t]*(?:\*\*|#{1,6}\s*)?DAY_(\d+)(?:[ \t]*\(([^)\n]+)\))?[ \t]*(?:\*\*)?[ \t]*(?::)?[ \t]*(?:\*\*)?/g;
+
+const buildMapDataSnapshot = (events: TimelineEvent[], lastIndex: number, snapshots: Record<number, any>) => {
+  if (!events.length || lastIndex < 0) return emptyMapData();
+
+  const event = events[lastIndex];
+  if (!event) return emptyMapData();
+
+  // Check if we have a specific snapshot for this day
+  if (snapshots && snapshots[event.day]) {
+    return normalizeMapData(snapshots[event.day]);
+  } 
+  
+  // Fallback to legacy mapData if no snapshot exists
+  if (event.mapData) {
+    return normalizeMapData(event.mapData);
+  }
+
+  return emptyMapData();
+};
+
 export default function App() {
   const [isAuthed, setIsAuthed] = useState(() => !!getSessionUsername());
   const [currentUsername, setCurrentUsername] = useState(() => getSessionUsername() || '');
+  const [isMainMenu, setIsMainMenu] = useState(true);
+  const [isRoleSelectOpen, setIsRoleSelectOpen] = useState(false);
+  const [isScenarioSelectOpen, setIsScenarioSelectOpen] = useState(false);
 
   const handleAuthSuccess = useCallback(() => {
     setIsAuthed(true);
@@ -39,6 +92,9 @@ export default function App() {
     logoutUser();
     setIsAuthed(false);
     setCurrentUsername('');
+    setIsMainMenu(true);
+    setIsRoleSelectOpen(false);
+    setIsScenarioSelectOpen(false);
   }, []);
 
   const [location, setLocation] = useState<[number, number]>([39.8283, -98.5795]); 
@@ -48,9 +104,9 @@ export default function App() {
   
   const activeScenario = useMemo(() => scenarios.find(s => s.id === selectedScenarioId) || scenarios[0] || DEFAULT_SCENARIOS[0], [scenarios, selectedScenarioId]);
 
-  const updateActiveScenario = useCallback((field: keyof Scenario, value: string) => {
-    setScenarios(prev => prev.map(s => s.id === selectedScenarioId ? { ...s, [field]: value } : s));
-  }, [selectedScenarioId]);
+  const updateScenario = useCallback((id: string, field: keyof Scenario, value: string) => {
+    setScenarios(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s));
+  }, []);
 
   const handleAddScenario = useCallback(() => {
     const newId = `scen_${Date.now()}`;
@@ -63,6 +119,7 @@ export default function App() {
     };
     setScenarios(prev => [...prev, newScenario]);
     setSelectedScenarioId(newId);
+    return newId;
   }, []);
 
   const handleDeleteScenario = useCallback((id: string) => {
@@ -75,9 +132,11 @@ export default function App() {
   }, [selectedScenarioId]);
   
   const [timeline, setTimeline] = useState<string>('');
+  const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({});
   const [isSimulating, setIsSimulating] = useState(false);
   const [isImageGenerating, setIsImageGenerating] = useState(false);
   const [stepAmount, setStepAmount] = useState('1 неделя');
+  const [eventFrequency, setEventFrequency] = useState('30 минут');
   const [images, setImages] = useState<Record<number, string>>({});
   const [imagePrompts, setImagePrompts] = useState<Record<number, string>>({});
   const [mainView, setMainView] = useState<'split' | 'map' | 'chat'>('split');
@@ -106,23 +165,20 @@ export default function App() {
     saveUserSettings(settings);
   }, [textProvider, textModel, imageModel, imageMode, openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale, scenarios, selectedScenarioId, isAuthed]);
 
-  if (!isAuthed) {
-    return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
-  }
-  
   const timelineEndRef = useRef<HTMLDivElement>(null);
 
   const parsedEvents = useMemo(() => {
     const events: TimelineEvent[] = [];
-    // Match DAY_X (Date): optionally with markdown bold, hashes, etc.
-    const headerRegex = /(?:^|\n)[ \t]*(?:\*\*|###\s*|##\s*|#\s*)?DAY_(\d+)[ \t]*\(([^)]+)\)(?:\*\*|:|\*\*:|:\*\*|[ \t])*/g;
+    // Match DAY_X headers with optional dates and markdown wrappers.
+    // The model occasionally omits "(Date)", and the map/day split must still stay correct.
+    const headerRegex = new RegExp(DAY_HEADER_REGEX);
     
     const matches = Array.from(timeline.matchAll(headerRegex));
 
     for (let i = 0; i < matches.length; i++) {
       const match = matches[i];
       const dayNum = parseInt(match[1], 10);
-      const dateStr = match[2];
+      const dateStr = match[2] || `DAY_${dayNum}`;
       
       const startIndex = match.index + match[0].length;
       const endIndex = i + 1 < matches.length ? matches[i + 1].index : timeline.length;
@@ -179,7 +235,11 @@ export default function App() {
   const [selectedDayIndex, setSelectedDayIndex] = useState<number>(-1);
 
   useEffect(() => {
-    if (isSimulating && parsedEvents.length > 0) {
+    if (parsedEvents.length > 0 && selectedDayIndex === -1) {
+      setSelectedDayIndex(0);
+    } else if (!isSimulating && parsedEvents.length > 0 && selectedDayIndex === parsedEvents.length - 2) {
+      // Auto-advance to the newly generated day only when generation completes, 
+      // and only if the user was on the previous day (meaning they were following along).
       setSelectedDayIndex(parsedEvents.length - 1);
     }
   }, [parsedEvents.length, isSimulating]);
@@ -187,23 +247,34 @@ export default function App() {
   const startSimulationStep = async () => {
     setIsSimulating(true);
     // If it's the first time, reset timeline. Otherwise, append
-    if (parsedEvents.length === 0) setTimeline('');
+    if (parsedEvents.length === 0) {
+      setTimeline('');
+      setMapSnapshots({});
+    }
     
     // Determine current elapsed context
     const elapsedDays = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].day : 0;
     const currentParsedDateStr = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].dateStr : startDate;
+    const latestMapData = buildMapDataSnapshot(parsedEvents, parsedEvents.length - 1, mapSnapshots);
 
     try {
+      const terrainContext = await buildTerrainContext(location);
       const symptomDesc = symptomPhases.map(p => `${p.name} (${p.dayRange}): ${p.description}`).join('\n');
       const stream = simulateOutbreakStepStream({
         location: `${location[0].toFixed(4)}, ${location[1].toFixed(4)}`,
+        terrainContext,
         startDate,
         scenario: `[Предисловие]: ${activeScenario.preface}\n[Начало/Причина]: ${activeScenario.origin}\n[Симптомы/Особенности]: ${activeScenario.symptoms}`,
         symptomDescription: symptomDesc,
         currentDate: currentParsedDateStr,
         elapsedDays,
         stepAmount,
+        eventFrequency,
         previousTimeline: timeline,
+        mapData: latestMapData,
+        onMapData: (day: number, mapData: any) => {
+          setMapSnapshots(prev => ({ ...prev, [day]: normalizeMapData(mapData) }));
+        },
         textModel,
         textProvider,
         openAiKey,
@@ -228,7 +299,7 @@ export default function App() {
           if (imageMode === 'on') {
               setIsImageGenerating(true);
               try {
-                 const imgBase64 = await generateCityImage(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`, imageModel, openAiKey);
+                 const imgBase64 = await generateCityImage(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`, imageModel, openAiKey, terrainContext);
                  setImages(prev => ({...prev, [lastDayInChunk]: imgBase64}));
               } catch (e: any) {
                  console.error("Image generation failed", e);
@@ -237,7 +308,7 @@ export default function App() {
                  setIsImageGenerating(false);
               }
           } else if (imageMode === 'prompt') {
-              const prompt = buildCityImagePrompt(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`);
+              const prompt = buildCityImagePrompt(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`, terrainContext);
               setImagePrompts(prev => ({...prev, [lastDayInChunk]: prompt}));
           }
       }
@@ -249,36 +320,72 @@ export default function App() {
     }
   };
 
+  // Removed automatic scrolling to bottom during generation to allow user to read at their own pace
   useEffect(() => {
-    timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [selectedDayIndex, timeline, images]);
+    // We could scroll to top when selectedDayIndex changes if needed, but for now we'll just prevent jumping.
+  }, [selectedDayIndex]);
 
-  const accumulatedMapData = useMemo(() => {
+  const currentDayMapData = useMemo(() => {
     if (!parsedEvents || parsedEvents.length === 0 || selectedDayIndex < 0) return undefined;
-    const result: any = { infected: [], movements: [], pois: [], perimeters: [] };
-    
-    for (let i = 0; i <= selectedDayIndex; i++) {
-        const data = parsedEvents[i]?.mapData;
-        if (data) {
-            if (data.infected) result.infected = [...(result.infected || []), ...data.infected];
-            if (data.movements) result.movements = [...(result.movements || []), ...data.movements];
-            if (data.pois) result.pois = [...(result.pois || []), ...data.pois];
-            if (data.perimeters) result.perimeters = [...(result.perimeters || []), ...data.perimeters];
-        }
-    }
-    return result;
-  }, [parsedEvents, selectedDayIndex]);
+    return buildMapDataSnapshot(parsedEvents, selectedDayIndex, mapSnapshots);
+  }, [parsedEvents, selectedDayIndex, mapSnapshots]);
+
+  const outbreakCounters = useMemo(() => ({
+    infected: getInfectionCount(currentDayMapData),
+    zombies: getZombieCount(currentDayMapData)
+  }), [currentDayMapData]);
 
   const currentEvent = parsedEvents[selectedDayIndex];
 
+  if (!isAuthed) {
+    return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
+  }
+
   return (
     <div className="bg-[#050505] text-[#A3A3A3] w-full h-screen font-mono flex flex-col select-none">
+      {isMainMenu ? (
+        isScenarioSelectOpen ? (
+          <ScenarioSelectScreen
+            scenarios={scenarios}
+            selectedScenarioId={selectedScenarioId}
+            activeScenario={activeScenario}
+            onSelectScenario={setSelectedScenarioId}
+            onAddScenario={handleAddScenario}
+            onDeleteScenario={handleDeleteScenario}
+            onUpdateScenario={updateScenario}
+            onBack={() => {
+              setIsScenarioSelectOpen(false);
+              setIsRoleSelectOpen(true);
+            }}
+            onContinue={() => {
+              setIsScenarioSelectOpen(false);
+              setIsRoleSelectOpen(false);
+              setIsMainMenu(false);
+            }}
+          />
+        ) : (
+        <MainMenuScreen
+          username={currentUsername}
+          isRoleSelectOpen={isRoleSelectOpen}
+          onOpenRoleSelect={() => setIsRoleSelectOpen(true)}
+          onCloseRoleSelect={() => setIsRoleSelectOpen(false)}
+          onStartVirusGame={() => {
+            setIsRoleSelectOpen(false);
+            setIsScenarioSelectOpen(true);
+          }}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+          onLogout={handleLogout}
+        />
+        )
+      ) : (
+        <>
       {/* Header */}
       <header className="h-16 border-b border-[#333] flex items-center justify-between px-6 bg-[#0A0A0A] shrink-0">
         <div className="flex items-center gap-4">
+          <img src="/logo.png" alt="Project Z Logo" className="w-10 h-10 object-contain" />
           <div className="w-3 h-3 rounded-full bg-red-600 animate-pulse"></div>
           <h1 className="text-lg md:text-xl font-bold tracking-tighter text-white uppercase flex items-center gap-2">
-            <span className="hidden sm:inline">PROJECT: </span>Z-SIM<span className="hidden sm:inline">ULATOR</span>
+            PROJECT Z
           </h1>
         </div>
         <div className="flex items-center gap-2 md:gap-6 text-sm">
@@ -327,57 +434,6 @@ export default function App() {
                     className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
                     value={startDate}
                     onChange={e => setStartDate(e.target.value)}
-                    disabled={isSimulating || parsedEvents.length > 0}
-                  />
-                </div>
-                
-                <div className="flex flex-col gap-2">
-                  <div className="flex justify-between items-center">
-                    <label className="text-[10px] uppercase text-[#555]">Scenario / Сценарий</label>
-                    <div className="flex gap-1">
-                      <button onClick={handleAddScenario} disabled={isSimulating || parsedEvents.length > 0} className="p-1 text-[#555] hover:text-green-500 disabled:opacity-30"><Plus className="w-3 h-3" /></button>
-                      <button onClick={() => handleDeleteScenario(selectedScenarioId)} disabled={isSimulating || parsedEvents.length > 0 || scenarios.length <= 1} className="p-1 text-[#555] hover:text-red-500 disabled:opacity-30"><Trash2 className="w-3 h-3" /></button>
-                    </div>
-                  </div>
-                  <select 
-                    className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
-                    value={selectedScenarioId}
-                    onChange={e => setSelectedScenarioId(e.target.value)}
-                    disabled={isSimulating || parsedEvents.length > 0}
-                  >
-                    {scenarios.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                  </select>
-
-                  <input
-                    type="text"
-                    placeholder="Название сценария"
-                    className="w-full bg-[#111] border border-[#333] p-2 text-[11px] text-white focus:outline-none focus:border-red-900 transition-colors"
-                    value={activeScenario.name}
-                    onChange={e => updateActiveScenario('name', e.target.value)}
-                    disabled={isSimulating || parsedEvents.length > 0}
-                  />
-
-                  <label className="text-[10px] uppercase text-[#555] mt-1">Preface / Предисловие</label>
-                  <textarea
-                    className="w-full h-16 bg-[#0A0A0A] border border-[#222] p-2 text-[11px] leading-relaxed text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors resize-none"
-                    value={activeScenario.preface}
-                    onChange={e => updateActiveScenario('preface', e.target.value)}
-                    disabled={isSimulating || parsedEvents.length > 0}
-                  />
-
-                  <label className="text-[10px] uppercase text-[#555] mt-1">Origin / Начало вируса</label>
-                  <textarea
-                    className="w-full h-20 bg-[#0A0A0A] border border-[#222] p-2 text-[11px] leading-relaxed text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors resize-none"
-                    value={activeScenario.origin}
-                    onChange={e => updateActiveScenario('origin', e.target.value)}
-                    disabled={isSimulating || parsedEvents.length > 0}
-                  />
-
-                  <label className="text-[10px] uppercase text-[#555] mt-1">Symptoms / Особенности вируса</label>
-                  <textarea
-                    className="w-full h-24 bg-[#0A0A0A] border border-[#222] p-2 text-[11px] leading-relaxed text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors resize-none"
-                    value={activeScenario.symptoms}
-                    onChange={e => updateActiveScenario('symptoms', e.target.value)}
                     disabled={isSimulating || parsedEvents.length > 0}
                   />
                 </div>
@@ -521,6 +577,18 @@ export default function App() {
                  <option value="1 месяц">1 месяц</option>
                  <option value="1 год">1 год</option>
                </select>
+               <label className="text-[10px] uppercase text-[#555]">Event Frequency</label>
+               <select 
+                 className="w-full bg-[#0A0A0A] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors disabled:opacity-50"
+                 value={eventFrequency}
+                 onChange={e => setEventFrequency(e.target.value)}
+                 disabled={isSimulating}
+               >
+                 <option value="30 минут">Каждые 30 минут</option>
+                 <option value="1 час">Каждый 1 час</option>
+                 <option value="3 часа">Каждые 3 часа</option>
+                 <option value="5 часов">Каждые 5 часов</option>
+               </select>
                <button
                  onClick={startSimulationStep}
                  disabled={isSimulating}
@@ -538,7 +606,13 @@ export default function App() {
             <div className="absolute inset-0 opacity-10 pointer-events-none z-10" style={{ backgroundImage: 'radial-gradient(#333 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
             
             <div className={`w-full ${imageMode === 'off' ? 'h-full' : 'h-1/2'} relative bg-[#0a0a0a] border-b border-[#333]`}>
-               <MapView location={location} setLocation={setLocation} mapData={accumulatedMapData} showOverlay={showMapOverlay} />
+               <MapView 
+                 location={location} 
+                 setLocation={setLocation} 
+                 mapData={currentDayMapData} 
+                 showOverlay={showMapOverlay} 
+                 isLocked={isSimulating || parsedEvents.length > 0}
+               />
                {/* Map overlay toggle */}
                <button
                  onClick={() => setShowMapOverlay(prev => !prev)}
@@ -551,7 +625,35 @@ export default function App() {
                  {showMapOverlay ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
                  {showMapOverlay ? 'Overlay: ON' : 'Overlay: OFF'}
                </button>
-               {/* Overlay Stats hidden for clarity, map runs independently */}
+               <div className="pointer-events-none absolute bottom-3 left-1/2 z-[1000] w-[min(92vw,560px)] -translate-x-1/2 md:bottom-4">
+                 <div className="relative overflow-hidden border border-cyan-300/70 bg-[#06141b]/88 shadow-[0_0_24px_rgba(34,211,238,0.16),inset_0_0_26px_rgba(34,211,238,0.08)] backdrop-blur-sm [clip-path:polygon(0_0,92%_0,100%_24%,100%_100%,4%_100%,0_76%)]">
+                   <div className="absolute inset-x-0 top-0 h-px bg-cyan-100/75" />
+                   <div className="absolute inset-0 opacity-20 [background:repeating-linear-gradient(0deg,transparent_0,transparent_4px,rgba(125,211,252,0.28)_5px)]" />
+                   <div className="relative grid grid-cols-2 divide-x divide-cyan-300/35">
+                     <div className="flex min-w-0 items-center gap-3 px-4 py-3 md:px-6">
+                       <Biohazard className="h-7 w-7 shrink-0 text-cyan-100 drop-shadow-[0_0_8px_rgba(165,243,252,0.65)]" strokeWidth={1.7} />
+                       <div className="min-w-0">
+                         <div className="truncate text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-100/82">Заражены</div>
+                         <div className="text-2xl font-bold leading-none text-white drop-shadow-[0_0_10px_rgba(255,255,255,0.35)] md:text-3xl">
+                           {formatCounter(outbreakCounters.infected)}
+                         </div>
+                       </div>
+                     </div>
+                     <div className="flex min-w-0 items-center gap-3 px-4 py-3 md:px-6">
+                       <Skull className="h-7 w-7 shrink-0 text-cyan-100 drop-shadow-[0_0_8px_rgba(165,243,252,0.65)]" strokeWidth={1.7} />
+                       <div className="min-w-0">
+                         <div className="truncate text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-100/82">Зомби</div>
+                         <div className="text-2xl font-bold leading-none text-white drop-shadow-[0_0_10px_rgba(255,255,255,0.35)] md:text-3xl">
+                           {formatCounter(outbreakCounters.zombies)}
+                         </div>
+                       </div>
+                     </div>
+                   </div>
+                   <div className="absolute bottom-2 left-5 right-5 h-[3px] border border-cyan-200/55 bg-cyan-500/25">
+                     <div className="h-full w-full bg-gradient-to-r from-cyan-500/30 via-cyan-200/80 to-cyan-500/30" />
+                   </div>
+                 </div>
+               </div>
             </div>
 
             {imageMode !== 'off' && (
@@ -692,6 +794,8 @@ export default function App() {
           <span className="text-red-900 font-bold">SIMULATION IS FOR MILITARY PURPOSES ONLY</span>
         </div>
       </footer>
+        </>
+      )}
 
       {/* Settings Modal */}
       {isSettingsOpen && (
@@ -851,5 +955,343 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+interface ScenarioSelectScreenProps {
+  scenarios: Scenario[];
+  selectedScenarioId: string;
+  activeScenario: Scenario;
+  onSelectScenario: (id: string) => void;
+  onAddScenario: () => string;
+  onDeleteScenario: (id: string) => void;
+  onUpdateScenario: (id: string, field: keyof Scenario, value: string) => void;
+  onBack: () => void;
+  onContinue: () => void;
+}
+
+function ScenarioSelectScreen({
+  scenarios,
+  selectedScenarioId,
+  activeScenario,
+  onSelectScenario,
+  onAddScenario,
+  onDeleteScenario,
+  onUpdateScenario,
+  onBack,
+  onContinue,
+}: ScenarioSelectScreenProps) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const editingScenario = scenarios.find(s => s.id === editingId) || null;
+
+  useEffect(() => {
+    if (editingId && !scenarios.some(s => s.id === editingId)) {
+      setEditingId(null);
+    }
+  }, [editingId, scenarios]);
+
+  const beginCreateScenario = () => {
+    const newId = onAddScenario();
+    setEditingId(newId);
+  };
+
+  const beginEditScenario = (id: string) => {
+    onSelectScenario(id);
+    setEditingId(id);
+  };
+
+  const detailSections = [
+    {
+      title: 'Предисловие',
+      text: activeScenario.preface,
+      empty: 'Предисловие пока не задано.',
+    },
+    {
+      title: 'Начало вируса',
+      text: activeScenario.origin,
+      empty: 'Начало сценария можно описать в редакторе.',
+    },
+    {
+      title: 'Особенности вируса',
+      text: activeScenario.symptoms,
+      empty: 'Особенности вируса пока не заданы.',
+    },
+  ];
+
+  return (
+    <section
+      className="scenario-selector-screen main-menu-screen relative flex-1 overflow-hidden text-white"
+      style={{
+        backgroundImage: `url(${menuBackground})`,
+      }}
+    >
+      <div className="menu-hex-grid" />
+      <div className="menu-scanline" />
+
+      <div className="absolute left-4 top-4 z-20 text-[10px] uppercase tracking-[0.3em] text-red-100/45">
+        Project Z / Scenario Selection
+      </div>
+
+      <div className="scenario-radar absolute left-1/2 top-1/2 hidden -translate-x-1/2 -translate-y-1/2 items-center justify-center md:flex">
+        <div className="scenario-radar-ring scenario-radar-ring-outer" />
+        <div className="scenario-radar-ring scenario-radar-ring-mid" />
+        <div className="scenario-radar-core">
+          <Biohazard className="h-[18vmin] w-[18vmin] text-red-100/78 drop-shadow-[0_0_38px_rgba(255,180,180,0.9)]" strokeWidth={1.35} />
+        </div>
+      </div>
+
+      <div className="relative z-10 grid h-full grid-rows-[1fr_auto] px-4 pb-4 pt-16 sm:px-6 lg:px-8">
+        <div className="scenario-selection-layout grid min-h-0 gap-5 lg:grid-cols-[minmax(260px,380px)_minmax(0,1fr)]">
+          <div className="scenario-list-panel min-h-0">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.26em] text-red-200/54">База сценариев</div>
+                <div className="mt-1 text-sm font-bold uppercase text-white/88">Выбор угрозы</div>
+              </div>
+              <button className="scenario-small-action" onClick={beginCreateScenario}>
+                <Plus className="h-4 w-4" />
+                <span>Создать</span>
+              </button>
+            </div>
+
+            <div className="scenario-list-scroll">
+              {scenarios.map((scenario) => {
+                const isActive = scenario.id === selectedScenarioId;
+                return (
+                  <button
+                    key={scenario.id}
+                    className={`scenario-choice-card ${isActive ? 'scenario-choice-card-active' : ''}`}
+                    onClick={() => onSelectScenario(scenario.id)}
+                  >
+                    <span className="scenario-choice-lines" />
+                    <span className="min-w-0 flex-1 text-right">
+                      <span className="block truncate text-xl font-bold leading-tight">{scenario.name || 'Без названия'}</span>
+                      <span className="mt-1 line-clamp-2 block text-xs leading-snug text-red-50/66">
+                        {scenario.preface || scenario.origin || 'Пользовательский сценарий'}
+                      </span>
+                    </span>
+                    <span className="scenario-choice-icon">
+                      <Biohazard className="h-10 w-10" strokeWidth={1.8} />
+                    </span>
+                    <span
+                      className="scenario-choice-edit"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        beginEditScenario(scenario.id);
+                      }}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="scenario-detail-panel min-h-0">
+            <div className="scenario-detail-header">
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.28em] text-red-200/60">Выбранный сценарий</div>
+                <h1>{activeScenario.name || 'Без названия'}</h1>
+              </div>
+              <button className="scenario-small-action scenario-edit-active" onClick={() => beginEditScenario(activeScenario.id)}>
+                <Pencil className="h-4 w-4" />
+                <span>Изменить</span>
+              </button>
+            </div>
+
+            <div className="scenario-detail-scroll">
+              {detailSections.map(section => (
+                <section key={section.title} className="scenario-detail-section">
+                  <h2>{section.title}</h2>
+                  <p>{section.text || section.empty}</p>
+                </section>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="scenario-bottom-bar scenario-bottom-bar-simple">
+          <button className="scenario-nav-button scenario-nav-button-left" onClick={onBack}>
+            <ChevronLeft className="h-6 w-6" />
+            <span>Назад</span>
+          </button>
+
+          <button className="scenario-nav-button scenario-nav-button-right" onClick={onContinue}>
+            <span>Продолжить</span>
+            <ChevronRight className="h-6 w-6" />
+          </button>
+        </div>
+      </div>
+
+      {editingScenario && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/72 p-4 backdrop-blur-sm">
+          <div className="scenario-editor w-full max-w-3xl">
+            <button
+              onClick={() => setEditingId(null)}
+              className="absolute right-5 top-5 text-red-100/55 transition-colors hover:text-white"
+              aria-label="Закрыть редактор"
+            >
+              <X className="h-5 w-5" />
+            </button>
+            <div className="mb-5 pr-10">
+              <div className="text-[10px] uppercase tracking-[0.28em] text-red-300/60">Редактор сценария</div>
+              <h2 className="mt-2 text-2xl font-bold uppercase tracking-wide text-white">Пользовательский сценарий</h2>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <label className="scenario-editor-field md:col-span-2">
+                <span>Название</span>
+                <input
+                  value={editingScenario.name}
+                  onChange={e => onUpdateScenario(editingScenario.id, 'name', e.target.value)}
+                  placeholder="Название сценария"
+                />
+              </label>
+              <label className="scenario-editor-field md:col-span-2">
+                <span>Предисловие</span>
+                <textarea
+                  rows={3}
+                  value={editingScenario.preface}
+                  onChange={e => onUpdateScenario(editingScenario.id, 'preface', e.target.value)}
+                  placeholder="Общий контекст: эпоха, страна, тон истории"
+                />
+              </label>
+              <label className="scenario-editor-field">
+                <span>Начало</span>
+                <textarea
+                  rows={6}
+                  value={editingScenario.origin}
+                  onChange={e => onUpdateScenario(editingScenario.id, 'origin', e.target.value)}
+                  placeholder="Где и почему начинается заражение"
+                />
+              </label>
+              <label className="scenario-editor-field">
+                <span>Особенности</span>
+                <textarea
+                  rows={6}
+                  value={editingScenario.symptoms}
+                  onChange={e => onUpdateScenario(editingScenario.id, 'symptoms', e.target.value)}
+                  placeholder="Симптомы, передача, ограничения и правила"
+                />
+              </label>
+            </div>
+            <div className="mt-5 flex items-center justify-between gap-3 border-t border-red-500/25 pt-4">
+              <button
+                className="scenario-editor-danger"
+                onClick={() => onDeleteScenario(editingScenario.id)}
+                disabled={scenarios.length <= 1}
+              >
+                <Trash2 className="h-4 w-4" />
+                <span>Удалить</span>
+              </button>
+              <button className="scenario-editor-save" onClick={() => setEditingId(null)}>
+                <Check className="h-4 w-4" />
+                <span>Готово</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface MainMenuScreenProps {
+  username: string;
+  isRoleSelectOpen: boolean;
+  onOpenRoleSelect: () => void;
+  onCloseRoleSelect: () => void;
+  onStartVirusGame: () => void;
+  onOpenSettings: () => void;
+  onLogout: () => void;
+}
+
+function MainMenuScreen({
+  username,
+  isRoleSelectOpen,
+  onOpenRoleSelect,
+  onCloseRoleSelect,
+  onStartVirusGame,
+  onOpenSettings,
+  onLogout,
+}: MainMenuScreenProps) {
+  return (
+    <section
+      className="main-menu-screen relative flex-1 overflow-hidden text-white"
+      style={{
+        backgroundImage: `url(${menuBackground})`,
+      }}
+    >
+      <div className="menu-hex-grid" />
+      <div className="menu-scanline" />
+
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        <Biohazard className="w-[34vmin] h-[34vmin] text-red-500/18 drop-shadow-[0_0_42px_rgba(255,0,52,0.42)]" strokeWidth={1.2} />
+      </div>
+
+      <div className="absolute left-4 right-4 top-4 z-20 flex items-start gap-4">
+        <div className="text-[10px] uppercase tracking-[0.3em] text-red-100/45">
+          Project Z / Main Interface
+        </div>
+      </div>
+
+      <div className="relative z-10 flex h-full items-end justify-between gap-6 px-4 pb-4 pt-20 sm:px-6 lg:px-8">
+        <aside className="menu-panel w-full max-w-[360px]">
+          <div className="menu-panel-title">
+            <span>Главное меню</span>
+          </div>
+          <div className="space-y-5 px-6 py-7">
+            <button className="menu-action-button" onClick={onOpenRoleSelect}>
+              <Play className="w-5 h-5" />
+              <span>Игра</span>
+            </button>
+            <button className="menu-action-button" onClick={onOpenSettings}>
+              <Settings className="w-5 h-5" />
+              <span>Настройки</span>
+            </button>
+          </div>
+          <div className="flex items-center justify-between border-t border-red-500/30 px-6 py-4 text-[10px] uppercase tracking-[0.2em] text-red-100/50">
+            <span>{username || 'Operator'}</span>
+            <button
+              onClick={onLogout}
+              className="flex items-center gap-2 text-red-100/50 transition-colors hover:text-red-100"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Выход</span>
+            </button>
+          </div>
+        </aside>
+      </div>
+
+      {isRoleSelectOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+          <div className="role-dialog w-full max-w-xl">
+            <button
+              onClick={onCloseRoleSelect}
+              className="absolute right-4 top-4 text-red-100/55 transition-colors hover:text-white"
+              aria-label="Закрыть"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <div className="mb-6 pr-10">
+              <div className="text-[10px] uppercase tracking-[0.28em] text-red-300/60">Режим запуска</div>
+              <h2 className="mt-2 text-2xl font-bold uppercase tracking-wide text-white">Выбор стороны</h2>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <button className="role-choice role-choice-ready" onClick={onStartVirusGame}>
+                <Biohazard className="w-9 h-9 text-red-300" />
+                <span>За вирус</span>
+                <small>Реализовано</small>
+              </button>
+              <button className="role-choice role-choice-disabled" disabled>
+                <UserRound className="w-9 h-9 text-cyan-200" />
+                <span>За человека</span>
+                <small>Пока не реализовано</small>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }

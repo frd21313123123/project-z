@@ -35,7 +35,7 @@ if not exist "node_modules" (
   )
 )
 
-echo Starting project at http://localhost:3000
+echo Starting Project Z at http://localhost:3000
 call npm run dev
 
 pause

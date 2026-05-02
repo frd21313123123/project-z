@@ -1,0 +1,128 @@
+- generic [ref=e3]:
+  - banner [ref=e164]:
+    - generic [ref=e165]:
+      - img "Project Z Logo" [ref=e166]
+      - heading "PROJECT Z" [level=1] [ref=e168]
+    - generic [ref=e169]:
+      - generic [ref=e170]:
+        - button "Map" [ref=e171]
+        - button "Split" [ref=e172]
+        - button "Chat" [ref=e173]
+      - button "Settings" [ref=e174]:
+        - img [ref=e175]
+        - generic [ref=e178]: Settings
+  - main [ref=e179]:
+    - complementary [ref=e180]:
+      - generic [ref=e181]:
+        - generic [ref=e182]:
+          - heading "Viral Profile" [level=2] [ref=e183]
+          - generic [ref=e184]:
+            - generic [ref=e185]:
+              - generic [ref=e186]: Start Date
+              - textbox [ref=e187]: 1989-07-03
+            - generic [ref=e188]:
+              - generic [ref=e189]:
+                - generic [ref=e190]: Scenario / Сценарий
+                - generic [ref=e191]:
+                  - button [ref=e192]:
+                    - img [ref=e193]
+                  - button [ref=e194]:
+                    - img [ref=e195]
+              - combobox [ref=e198]:
+                - 'option "Базовый: Утечка реагента"'
+                - option "Новый сценарий" [selected]
+              - generic [ref=e199]: Preface / Предисловие
+              - textbox [ref=e200]
+              - generic [ref=e201]: Origin / Начало вируса
+              - textbox [ref=e202]
+              - generic [ref=e203]: Symptoms / Особенности вируса
+              - textbox [ref=e204]
+        - generic [ref=e205]:
+          - generic [ref=e206]:
+            - heading "Symptom Matrix" [level=2] [ref=e207]
+            - generic [ref=e208]:
+              - button "Добавить фазу" [ref=e209]:
+                - img [ref=e210]
+              - button "Сбросить к стандартным" [ref=e211]:
+                - img [ref=e212]
+          - generic [ref=e215]:
+            - generic [ref=e217] [cursor=pointer]:
+              - generic [ref=e218]:
+                - generic [ref=e220]: Phase I (D1-2)
+                - img [ref=e221]
+              - paragraph [ref=e224]: Бессимптомная форма.
+            - generic [ref=e226] [cursor=pointer]:
+              - generic [ref=e227]:
+                - generic [ref=e229]: Phase II (D3-4)
+                - img [ref=e230]
+              - paragraph [ref=e233]: Недомогание, температура.
+            - generic [ref=e235] [cursor=pointer]:
+              - generic [ref=e236]:
+                - generic [ref=e238]: Phase III (D5+)
+                - img [ref=e239]
+              - paragraph [ref=e242]: Превращение.
+      - generic [ref=e244]:
+        - generic [ref=e245]: Period Step
+        - combobox [ref=e246]:
+          - option "1 день"
+          - option "3 дня"
+          - option "1 неделя" [selected]
+          - option "1 месяц"
+          - option "1 год"
+        - generic [ref=e247]: Event Frequency
+        - combobox [ref=e248]:
+          - option "Каждые 30 минут" [selected]
+          - option "Каждый 1 час"
+          - option "Каждые 3 часа"
+          - option "Каждые 5 часов"
+        - button "Initiate Leak" [ref=e249]
+    - generic [ref=e250]:
+      - generic [ref=e251]:
+        - generic [ref=e252]:
+          - generic [ref=e253]:
+            - button "Marker" [ref=e254] [cursor=pointer]
+            - generic:
+              - generic [ref=e255]:
+                - button "Zoom in" [ref=e256] [cursor=pointer]: +
+                - button "Zoom out" [ref=e257] [cursor=pointer]: −
+              - generic [ref=e258]:
+                - link "Leaflet" [ref=e259] [cursor=pointer]:
+                  - /url: https://leafletjs.com
+                  - img [ref=e260]
+                  - text: Leaflet
+                - text: "| ©"
+                - link "CartoDB" [ref=e264] [cursor=pointer]:
+                  - /url: https://carto.com/
+          - generic:
+            - generic: Система геолокации активна. Нажмите на карту для выбора очага поражения.
+        - 'button "Overlay: ON" [ref=e265]':
+          - img [ref=e266]
+          - text: "Overlay: ON"
+      - generic [ref=e269]:
+        - heading "Drone Visual Reconnaissance" [level=2] [ref=e270]
+        - generic [ref=e271]:
+          - img [ref=e272]
+          - generic [ref=e276]: No visual data for current day
+    - complementary [ref=e277]:
+      - generic [ref=e278]:
+        - heading "Timeline Log" [level=2] [ref=e279]
+        - generic [ref=e281]:
+          - button "A-" [ref=e282]
+          - generic [ref=e283]: 100%
+          - button "A+" [ref=e284]
+      - generic [ref=e286]:
+        - generic [ref=e287]: T - 00:00
+        - paragraph [ref=e288]: Awaiting initial human contact reports... Select Date & Step to "Initiate Leak".
+      - generic [ref=e292]:
+        - generic [ref=e293]: Start
+        - generic [ref=e294]: Timeline Progress
+        - generic [ref=e295]: End
+  - contentinfo [ref=e296]:
+    - generic [ref=e297]:
+      - generic [ref=e298]: "User: CODEX"
+      - generic [ref=e299]: "Security: LEVEL 5"
+      - generic [ref=e300]: "Link: SECURE_128-BIT"
+      - button "Выход" [ref=e301] [cursor=pointer]:
+        - img [ref=e302]
+        - generic [ref=e305]: Выход
+    - generic [ref=e307]: SIMULATION IS FOR MILITARY PURPOSES ONLY

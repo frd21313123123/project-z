@@ -1,0 +1,36 @@
+- generic [ref=e57]:
+  - generic [ref=e58]: Project Z / Scenario Selection
+  - generic:
+    - generic:
+      - img
+  - generic [ref=e59]:
+    - generic [ref=e60]:
+      - generic [ref=e62]:
+        - generic [ref=e63]: Выбранный сценарий
+        - 'heading "Базовый: Утечка реагента" [level=1] [ref=e64]'
+        - paragraph [ref=e66]: События разворачиваются в наши дни.
+        - paragraph [ref=e67]: При перевозки секретного реагинета военными автомобиль в который содержал этот реагент попадает в дородную аварию в результате чего происходит утечка этого реагента.
+      - generic [ref=e68]:
+        - generic [ref=e69]:
+          - generic [ref=e70]:
+            - generic [ref=e71]: База сценариев
+            - generic [ref=e72]: Выбор угрозы
+          - button "Создать" [ref=e73]:
+            - img [ref=e74]
+            - generic [ref=e75]: Создать
+        - 'button "Базовый: Утечка реагента События разворачиваются в наши дни." [ref=e77]':
+          - generic [ref=e79]:
+            - generic [ref=e80]: "Базовый: Утечка реагента"
+            - generic [ref=e81]: События разворачиваются в наши дни.
+          - img [ref=e83]
+          - img [ref=e94]
+    - generic [ref=e97]:
+      - button "Назад" [ref=e98]:
+        - img [ref=e99]
+        - generic [ref=e101]: Назад
+      - generic [ref=e102]:
+        - generic [ref=e103]: Сценариев доступно
+        - strong [ref=e106]: "1"
+      - button "Продолжить" [ref=e107]:
+        - generic [ref=e108]: Продолжить
+        - img [ref=e109]

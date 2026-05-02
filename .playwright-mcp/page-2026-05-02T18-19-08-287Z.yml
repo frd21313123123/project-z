@@ -1,0 +1,74 @@
+- generic [ref=e57]:
+  - generic [ref=e58]: Project Z / Scenario Selection
+  - generic:
+    - generic:
+      - img
+  - generic [ref=e59]:
+    - generic [ref=e60]:
+      - generic [ref=e62]:
+        - generic [ref=e63]: Выбранный сценарий
+        - heading "Новый сценарий" [level=1] [ref=e111]
+        - paragraph [ref=e66]: Предисловие пока не задано.
+        - paragraph [ref=e67]: Начало сценария можно описать в редакторе.
+      - generic [ref=e68]:
+        - generic [ref=e69]:
+          - generic [ref=e70]:
+            - generic [ref=e71]: База сценариев
+            - generic [ref=e72]: Выбор угрозы
+          - button "Создать" [active] [ref=e73]:
+            - img [ref=e74]
+            - generic [ref=e75]: Создать
+        - generic [ref=e76]:
+          - 'button "Базовый: Утечка реагента События разворачиваются в наши дни." [ref=e77]':
+            - generic [ref=e79]:
+              - generic [ref=e80]: "Базовый: Утечка реагента"
+              - generic [ref=e81]: События разворачиваются в наши дни.
+            - img [ref=e83]
+            - img [ref=e94]
+          - button "Новый сценарий Пользовательский сценарий" [ref=e112]:
+            - generic [ref=e114]:
+              - generic [ref=e115]: Новый сценарий
+              - generic [ref=e116]: Пользовательский сценарий
+            - img [ref=e118]
+            - img [ref=e129]
+    - generic [ref=e97]:
+      - button "Назад" [ref=e98]:
+        - img [ref=e99]
+        - generic [ref=e101]: Назад
+      - generic [ref=e102]:
+        - generic [ref=e103]: Сценариев доступно
+        - strong [ref=e106]: "2"
+      - button "Продолжить" [ref=e107]:
+        - generic [ref=e108]: Продолжить
+        - img [ref=e109]
+  - generic [ref=e133]:
+    - button "Закрыть редактор" [ref=e134]:
+      - img [ref=e135]
+    - generic [ref=e138]:
+      - generic [ref=e139]: Редактор сценария
+      - heading "Пользовательский сценарий" [level=2] [ref=e140]
+    - generic [ref=e141]:
+      - generic [ref=e142]:
+        - generic [ref=e143]: Название
+        - textbox "Название" [ref=e144]:
+          - /placeholder: Название сценария
+          - text: Новый сценарий
+      - generic [ref=e145]:
+        - generic [ref=e146]: Предисловие
+        - textbox "Предисловие" [ref=e147]:
+          - /placeholder: "Общий контекст: эпоха, страна, тон истории"
+      - generic [ref=e148]:
+        - generic [ref=e149]: Начало
+        - textbox "Начало" [ref=e150]:
+          - /placeholder: Где и почему начинается заражение
+      - generic [ref=e151]:
+        - generic [ref=e152]: Особенности
+        - textbox "Особенности" [ref=e153]:
+          - /placeholder: Симптомы, передача, ограничения и правила
+    - generic [ref=e154]:
+      - button "Удалить" [ref=e155]:
+        - img [ref=e156]
+        - generic [ref=e159]: Удалить
+      - button "Готово" [ref=e160]:
+        - img [ref=e161]
+        - generic [ref=e163]: Готово
