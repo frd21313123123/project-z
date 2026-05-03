@@ -99,6 +99,7 @@ export default function App() {
     setTextModel(saved.textModel);
     setImageModel(saved.imageModel);
     setImageMode(saved.imageMode);
+    setGeminiKey(saved.geminiKey || '');
     setOpenAiKey(saved.openAiKey);
     setOpenRouterKey(saved.openRouterKey);
     setShowMapOverlay(saved.showMapOverlay);
@@ -143,6 +144,7 @@ export default function App() {
   const [textProvider, setTextProvider] = useState<'gemini' | 'openai' | 'openrouter'>(initialSettings.textProvider);
   const [textModel, setTextModel] = useState(initialSettings.textModel);
   const [imageModel, setImageModel] = useState(initialSettings.imageModel);
+  const [geminiKey, setGeminiKey] = useState(initialSettings.geminiKey || '');
   const [openAiKey, setOpenAiKey] = useState(initialSettings.openAiKey);
   const [openRouterKey, setOpenRouterKey] = useState(initialSettings.openRouterKey);
   const [showMapOverlay, setShowMapOverlay] = useState(initialSettings.showMapOverlay);
@@ -291,14 +293,58 @@ export default function App() {
     input.onchange = (e: any) => {
       const file = e.target.files[0];
       if (!file) return;
+
+      // Reject files larger than 50MB to prevent DoS via localStorage overflow
+      const MAX_FILE_SIZE = 50 * 1024 * 1024;
+      if (file.size > MAX_FILE_SIZE) {
+        addNotification('Ошибка импорта: файл слишком большой (макс. 50 МБ)', 'error');
+        return;
+      }
+
       const reader = new FileReader();
       reader.onload = (re) => {
         try {
-          const save = JSON.parse(re.target?.result as string);
+          const raw = re.target?.result as string;
+          const save = JSON.parse(raw);
+
+          // Validate required fields and types
+          if (typeof save !== 'object' || save === null || Array.isArray(save)) {
+            throw new Error('Root must be a JSON object');
+          }
+          if (save.timeline !== undefined && typeof save.timeline !== 'string') {
+            throw new Error('timeline must be a string');
+          }
+          if (save.mapSnapshots !== undefined && (typeof save.mapSnapshots !== 'object' || Array.isArray(save.mapSnapshots))) {
+            throw new Error('mapSnapshots must be an object');
+          }
+          if (save.mutationPoints !== undefined && typeof save.mutationPoints !== 'number') {
+            throw new Error('mutationPoints must be a number');
+          }
+          if (save.activeMutations !== undefined && !Array.isArray(save.activeMutations)) {
+            throw new Error('activeMutations must be an array');
+          }
+          if (save.symptomPhases !== undefined && !Array.isArray(save.symptomPhases)) {
+            throw new Error('symptomPhases must be an array');
+          }
+          if (save.location !== undefined) {
+            if (!Array.isArray(save.location) || save.location.length !== 2 || !save.location.every((v: any) => typeof v === 'number' && Number.isFinite(v))) {
+              throw new Error('location must be [lat, lng]');
+            }
+          }
+          if (save.scenarios !== undefined && !Array.isArray(save.scenarios)) {
+            throw new Error('scenarios must be an array');
+          }
+          if (save.images !== undefined && (typeof save.images !== 'object' || Array.isArray(save.images))) {
+            throw new Error('images must be an object');
+          }
+
+          // Strip any __proto__ or constructor pollution attempts
+          const sanitized = JSON.parse(JSON.stringify(save));
+
           if (timeline !== '' && !window.confirm("Импорт файла перезапишет текущий прогресс. Продолжить?")) return;
-          applySaveData(save);
+          applySaveData(sanitized);
         } catch (err: any) {
-          addNotification('Ошибка импорта: неверный формат файла', 'error');
+          addNotification(`Ошибка импорта: ${err.message || 'неверный формат файла'}`, 'error');
         }
       };
       reader.readAsText(file);
@@ -310,12 +356,12 @@ export default function App() {
     if (!isAuthed) return;
     const settings: UserSettings = {
       textProvider, textModel, imageModel, imageMode,
-      openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale,
+      geminiKey, openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale,
       scenarios, selectedScenarioId,
       mutationPoints, mutations: activeMutations
     };
     saveUserSettings(settings);
-  }, [textProvider, textModel, imageModel, imageMode, openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale, scenarios, selectedScenarioId, isAuthed, mutationPoints, activeMutations]);
+  }, [textProvider, textModel, imageModel, imageMode, geminiKey, openAiKey, openRouterKey, showMapOverlay, symptomPhases, textScale, scenarios, selectedScenarioId, isAuthed, mutationPoints, activeMutations]);
 
   const timelineEndRef = useRef<HTMLDivElement>(null);
 
@@ -422,6 +468,7 @@ export default function App() {
         onNotification: addNotification,
         textModel,
         textProvider,
+        geminiKey,
         openAiKey,
         openRouterKey
       });
@@ -443,7 +490,7 @@ export default function App() {
           if (imageMode === 'on') {
               setIsImageGenerating(true);
               try {
-                 const imgBase64 = await generateCityImage(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`, imageModel, openAiKey, terrainContext);
+                 const imgBase64 = await generateCityImage(newTimelineChunk, `${location[0].toFixed(2)}, ${location[1].toFixed(2)}`, imageModel, openAiKey, terrainContext, geminiKey);
                  setImages(prev => ({...prev, [lastDayInChunk]: imgBase64}));
               } catch (e: any) {
                  console.error("Image generation failed", e);
@@ -499,7 +546,7 @@ export default function App() {
       const apiKey = textProvider === 'openrouter' ? openRouterKey : openAiKey;
       const providerName = textProvider === 'openrouter' ? "OpenRouter" : "OpenAI";
       
-      const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName, textModel };
+      const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName, textModel, geminiKey };
       const currentElapsedDays = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1].day : 0;
       
       const res = await evaluateMutationProposal(
@@ -992,6 +1039,21 @@ export default function App() {
                   <option value="openrouter">OpenRouter</option>
                 </select>
               </div>
+
+              {textProvider === 'gemini' && (
+                 <div className="flex flex-col gap-1">
+                   <label className="text-[10px] uppercase text-[#555]">Gemini API Key</label>
+                   <input 
+                     type="password" 
+                     value={geminiKey} 
+                     onChange={e => setGeminiKey(e.target.value)} 
+                     className="w-full bg-[#111] border border-[#222] p-2 text-xs text-[#A3A3A3] focus:outline-none focus:border-red-900 transition-colors" 
+                     placeholder="AIza..." 
+                     disabled={isSimulating}
+                   />
+                   <span className="text-[9px] text-[#555]">Required for Gemini. Get a key at aistudio.google.com</span>
+                 </div>
+              )}
 
               {textProvider === 'openai' && (
                  <div className="flex flex-col gap-1">

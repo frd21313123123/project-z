@@ -1,6 +1,37 @@
 import { GoogleGenAI } from "@google/genai";
 
-const getGenAI = () => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const getGenAI = (apiKey: string) => {
+    if (!apiKey) throw new Error("Gemini API Key is required. Please enter it in the settings.");
+    return new GoogleGenAI({ apiKey });
+};
+
+// --- Prompt Injection Protection ---
+const INJECTION_PATTERNS = [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directions?|context)/gi,
+    /disregard\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directions?)/gi,
+    /you\s+are\s+now\s+a/gi,
+    /act\s+as\s+(a\s+)?(?:different|new|helpful|general)/gi,
+    /forget\s+(everything|all|your)\s+(you|instructions?|rules?)/gi,
+    /override\s+(system|instructions?|rules?|safety)/gi,
+    /new\s+instructions?:/gi,
+    /system\s*:\s*/gi,
+    /\[\s*SYSTEM\s*\]/gi,
+    /\[\s*INST\s*\]/gi,
+    /<\|im_start\|>/gi,
+    /<\|im_end\|>/gi,
+];
+
+const MAX_USER_INPUT_LENGTH = 5000;
+
+/** Sanitize user-provided text before embedding it in AI prompts. */
+const sanitizePromptInput = (input: string, maxLength = MAX_USER_INPUT_LENGTH): string => {
+    if (!input || typeof input !== 'string') return '';
+    let sanitized = input.slice(0, maxLength);
+    for (const pattern of INJECTION_PATTERNS) {
+        sanitized = sanitized.replace(pattern, '[blocked]');
+    }
+    return sanitized;
+};
 
 const EMPTY_MAP_DATA = {
     infected: [],
@@ -106,7 +137,7 @@ ${masterContext?.masterPlan || 'No master plan available.'}
 
 Active viral mutations:
 ${params.activeMutations?.length > 0 
-    ? params.activeMutations.map((m: any) => `- ${m.name}: ${m.description}`).join('\n')
+    ? params.activeMutations.map((m: any) => `- ${sanitizePromptInput(m.name, 100)}: ${sanitizePromptInput(m.description, 500)}`).join('\n')
     : 'No active mutations.'}
 
 Geographic and terrain context:
@@ -184,7 +215,7 @@ Rules:
         if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
         raw = data.choices?.[0]?.message?.content || "";
     } else {
-        const ai = getGenAI();
+        const ai = getGenAI(apiMeta.geminiKey || params.geminiKey);
         const response = await ai.models.generateContent({
             model: params.textModel || "gemini-3.1-pro-preview",
             contents: mapPrompt,
@@ -246,7 +277,7 @@ Current Game State:
 - Total Infected (Living): ${currentStats.infected}
 - Total Zombies: ${currentStats.zombies}
 
-Player Proposal: "${proposal}"
+Player Proposal: "${sanitizePromptInput(proposal)}"
 
 CRITICAL RULES:
 1. NO INSTANT WINS: Reject mutations like "everyone dies", "humanity surrenders", or "instant 100% infection".
@@ -286,7 +317,7 @@ Return ONLY a JSON object:
         if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
         raw = data.choices?.[0]?.message?.content || "";
     } else {
-        const ai = getGenAI();
+        const ai = getGenAI(apiMeta.geminiKey);
         const response = await ai.models.generateContent({
             model: apiMeta.textModel || "gemini-3.1-pro-preview",
             contents: prompt,
@@ -307,7 +338,7 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
     const apiUrl = params.textProvider === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
     const apiKey = params.textProvider === 'openrouter' ? params.openRouterKey : params.openAiKey;
     const providerName = params.textProvider === 'openrouter' ? "OpenRouter" : "OpenAI";
-    const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName };
+    const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName, geminiKey: params.geminiKey };
     const onNotification = params.onNotification;
     let daysToSimulate = 1;
     let daysPerGeneration = 1;
@@ -330,17 +361,17 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
     }
 
     const mutationDescription = params.activeMutations?.length > 0 
-        ? `\nАКТИВНЫЕ МУТАЦИИ ВИРУСА:\n${params.activeMutations.map((m: any) => `- ${m.name}: ${m.description} (Применена на день ${m.dayApplied})`).join('\n')}`
+        ? `\nАКТИВНЫЕ МУТАЦИИ ВИРУСА:\n${params.activeMutations.map((m: any) => `- ${sanitizePromptInput(m.name, 100)}: ${sanitizePromptInput(m.description, 500)} (Применена на день ${Number(m.dayApplied) || 0})`).join('\n')}`
         : '';
 
     const masterPrompt = `Ты - Мастер Симуляции Вируса (Уровень Стратегии).
 Твоя задача — составить стратегический план (промпт) для другой нейросети-логгера на следующий период: ${params.stepAmount}.
 
 Сценарий:
-${params.scenario}
+${sanitizePromptInput(params.scenario)}
 
 Фазы симптомов вируса:
-${params.symptomDescription || 'Не указаны'}
+${sanitizePromptInput(params.symptomDescription || 'Не указаны')}
 ${mutationDescription}
 
 Стартовая позиция: ${params.location}
@@ -378,7 +409,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
         if (!res.ok) throw new Error(data.error?.message || `${providerName} API Error`);
         masterPlan = data.choices[0].message.content;
     } else {
-        const ai = getGenAI();
+        const ai = getGenAI(params.geminiKey);
         const masterResponse = await ai.models.generateContent({
             model: params.textModel || "gemini-3.1-pro-preview",
             contents: masterPrompt,
@@ -483,7 +514,7 @@ ${fullTimelineContext || 'Ранее событий нет.'}
                 }
             }
         } else {
-            const ai = getGenAI();
+            const ai = getGenAI(params.geminiKey);
             const stream = await ai.models.generateContentStream({
                 model: params.textModel || "gemini-3.1-pro-preview",
                 contents: dayPrompt,
@@ -569,7 +600,7 @@ ${timelineText.slice(-1000)}
 Покажи вид города, разрушения или состояние людей. Без текста на изображении. Кинематографичный стиль, мрачный, напряженный, детализированный.`;
 }
 
-export async function generateCityImage(timelineText: string, location: string, imageModel: string = 'imagen-3.0-generate-002', openAiKey?: string, terrainContext?: string): Promise<string> {
+export async function generateCityImage(timelineText: string, location: string, imageModel: string = 'imagen-3.0-generate-002', openAiKey?: string, terrainContext?: string, geminiKey?: string): Promise<string> {
     const prompt = buildCityImagePrompt(timelineText, location, terrainContext);
 
     const generateImage = async (model: string) => {
@@ -594,7 +625,7 @@ export async function generateCityImage(timelineText: string, location: string, 
             return `data:image/jpeg;base64,${data.data[0].b64_json}`;
         }
 
-        const ai = getGenAI();
+        const ai = getGenAI(geminiKey || '');
         if (model.startsWith('imagen')) {
             const response = await ai.models.generateImages({
                 model: model,
