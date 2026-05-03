@@ -27,6 +27,21 @@ export interface Mutation {
   dayApplied: number;
 }
 
+export interface GameSave {
+  timeline: string;
+  mapSnapshots: Record<number, any>;
+  mutationPoints: number;
+  activeMutations: Mutation[];
+  symptomPhases: SymptomPhase[];
+  startDate: string;
+  location: [number, number];
+  selectedScenarioId: string;
+  scenarios: Scenario[];
+  images: Record<number, string>;
+  imagePrompts: Record<number, string>;
+  lastUpdated: string;
+}
+
 export interface UserSettings {
   textProvider: 'gemini' | 'openai' | 'openrouter';
   textModel: string;
@@ -47,6 +62,7 @@ export interface UserProfile {
   username: string;
   passwordHash: string;
   settings: UserSettings;
+  gameSave?: GameSave;
   createdAt: string;
 }
 
@@ -90,16 +106,21 @@ async function hashPassword(password: string): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+let usersCache: Record<string, UserProfile> | null = null;
+
 function getAllUsers(): Record<string, UserProfile> {
+  if (usersCache) return usersCache;
   try {
     const raw = localStorage.getItem(USERS_KEY);
-    return raw ? JSON.parse(raw) : {};
+    usersCache = raw ? JSON.parse(raw) : {};
+    return usersCache!;
   } catch {
     return {};
   }
 }
 
 function saveAllUsers(users: Record<string, UserProfile>): void {
+  usersCache = users;
   localStorage.setItem(USERS_KEY, JSON.stringify(users));
 }
 
@@ -172,6 +193,22 @@ export function saveUserSettings(settings: UserSettings): void {
     users[key].settings = settings;
     saveAllUsers(users);
   }
+}
+
+export function saveGame(gameSave: GameSave): void {
+  const key = localStorage.getItem(SESSION_KEY);
+  if (!key) return;
+
+  const users = getAllUsers();
+  if (users[key]) {
+    users[key].gameSave = gameSave;
+    saveAllUsers(users);
+  }
+}
+
+export function loadGame(): GameSave | null {
+  const user = getCurrentUser();
+  return user?.gameSave || null;
 }
 
 export function getUserSettings(): UserSettings {
