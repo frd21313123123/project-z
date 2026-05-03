@@ -1,12 +1,15 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { MapView } from './components/MapView';
+import { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense } from 'react';
 import { AuthScreen } from './components/AuthScreen';
 import { simulateOutbreakStepStream, generateCityImage, buildCityImagePrompt, evaluateMutationProposal } from './lib/gemini';
 import { buildTerrainContext } from './lib/geoContext';
-import { getSessionUsername, getUserSettings, saveUserSettings, logoutUser, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS } from './lib/auth';
-import ReactMarkdown from 'react-markdown';
-import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, Play, UserRound, Skull, Microscope, Dna } from 'lucide-react';
-import menuBackground from '../background.png';
+import { getSessionUsername, getUserSettings, saveUserSettings, logoutUser, saveGame, loadGame, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS, type GameSave } from './lib/auth';
+import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, UserRound, Skull, Microscope, Dna, Save, Upload, Download } from 'lucide-react';
+
+// Lazy load heavy components
+const MapView = lazy(() => import('./components/MapView').then(module => ({ default: module.MapView })));
+const MainMenuScreen = lazy(() => import('./components/MainMenuScreen').then(module => ({ default: module.MainMenuScreen })));
+const ScenarioSelectScreen = lazy(() => import('./components/ScenarioSelectScreen').then(module => ({ default: module.ScenarioSelectScreen })));
+const ReactMarkdown = lazy(() => import('react-markdown'));
 
 interface TimelineEvent {
   day: number;
@@ -57,12 +60,10 @@ const buildMapDataSnapshot = (events: TimelineEvent[], lastIndex: number, snapsh
   const event = events[lastIndex];
   if (!event) return emptyMapData();
 
-  // Check if we have a specific snapshot for this day
   if (snapshots && snapshots[event.day]) {
     return normalizeMapData(snapshots[event.day]);
   } 
   
-  // Fallback to legacy mapData if no snapshot exists
   if (event.mapData) {
     return normalizeMapData(event.mapData);
   }
@@ -70,7 +71,17 @@ const buildMapDataSnapshot = (events: TimelineEvent[], lastIndex: number, snapsh
   return emptyMapData();
 };
 
+const LoadingUI = () => (
+  <div className="w-full h-full flex items-center justify-center bg-[#050505] text-red-500 font-mono text-xs uppercase tracking-widest">
+    <Loader2 className="w-6 h-6 animate-spin mr-3" />
+    Загрузка системы...
+  </div>
+);
+
 export default function App() {
+  // Initialize settings once
+  const initialSettings = useMemo(() => getUserSettings(), []);
+
   const [isAuthed, setIsAuthed] = useState(() => !!getSessionUsername());
   const [currentUsername, setCurrentUsername] = useState(() => getSessionUsername() || '');
   const [isMainMenu, setIsMainMenu] = useState(true);
@@ -94,9 +105,9 @@ export default function App() {
     setSymptomPhases(saved.symptomPhases || DEFAULT_SYMPTOM_PHASES);
     setScenarios(saved.scenarios || DEFAULT_SCENARIOS);
     setSelectedScenarioId(saved.selectedScenarioId || 'default_zombie');
-    setMutationPoints(saved.mutationPoints ?? 50);
+    setMutationPoints(saved.mutationPoints ?? 80);
     setActiveMutations(saved.mutations || []);
-  }, []);
+    }, []);
 
   const handleLogout = useCallback(() => {
     logoutUser();
@@ -109,14 +120,65 @@ export default function App() {
 
   const [location, setLocation] = useState<[number, number]>([39.8283, -98.5795]); 
   const [startDate, setStartDate] = useState('1989-07-03');
-  const [scenarios, setScenarios] = useState<Scenario[]>(() => getUserSettings().scenarios || DEFAULT_SCENARIOS);
-  const [selectedScenarioId, setSelectedScenarioId] = useState<string>(() => getUserSettings().selectedScenarioId || 'default_zombie');
+  const [scenarios, setScenarios] = useState<Scenario[]>(initialSettings.scenarios || DEFAULT_SCENARIOS);
+  const [selectedScenarioId, setSelectedScenarioId] = useState<string>(initialSettings.selectedScenarioId || 'default_zombie');
   
   const activeScenario = useMemo(() => scenarios.find(s => s.id === selectedScenarioId) || scenarios[0] || DEFAULT_SCENARIOS[0], [scenarios, selectedScenarioId]);
 
   const updateScenario = useCallback((id: string, field: keyof Scenario, value: string) => {
     setScenarios(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s));
   }, []);
+
+  const [timeline, setTimeline] = useState<string>('');
+  const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({});
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [isImageGenerating, setIsImageGenerating] = useState(false);
+  const [stepAmount, setStepAmount] = useState('3 дня');
+  const [eventFrequency, setEventFrequency] = useState('3 часа');
+  const [images, setImages] = useState<Record<number, string>>({});
+  const [imagePrompts, setImagePrompts] = useState<Record<number, string>>({});
+  const [mainView, setMainView] = useState<'split' | 'map' | 'chat'>('split');
+  
+  const [imageMode, setImageMode] = useState<'on' | 'off' | 'prompt'>(initialSettings.imageMode);
+  const [textProvider, setTextProvider] = useState<'gemini' | 'openai' | 'openrouter'>(initialSettings.textProvider);
+  const [textModel, setTextModel] = useState(initialSettings.textModel);
+  const [imageModel, setImageModel] = useState(initialSettings.imageModel);
+  const [openAiKey, setOpenAiKey] = useState(initialSettings.openAiKey);
+  const [openRouterKey, setOpenRouterKey] = useState(initialSettings.openRouterKey);
+  const [showMapOverlay, setShowMapOverlay] = useState(initialSettings.showMapOverlay);
+  const [symptomPhases, setSymptomPhases] = useState<SymptomPhase[]>(initialSettings.symptomPhases || DEFAULT_SYMPTOM_PHASES);
+  const [textScale, setTextScale] = useState<number>(initialSettings.textScale ?? 1.0);
+  
+  const [mutationPoints, setMutationPoints] = useState<number>(80);
+  const [activeMutations, setActiveMutations] = useState<any[]>([]);
+  const [mutationProposal, setMutationProposal] = useState('');
+  const [evaluationResult, setEvaluationResult] = useState<{ approved: boolean; cost: number; reason: string; name: string } | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+
+  const [selectedDayIndex, setSelectedDayIndex] = useState<number>(-1);
+
+  const handleResetGame = useCallback((confirm = true) => {
+    if (confirm && timeline !== '' && !window.confirm("Вы уверены, что хотите сбросить текущую игру? Весь прогресс будет потерян.")) {
+      return;
+    }
+    setTimeline('');
+    setMapSnapshots({});
+    setMutationPoints(80);
+    setActiveMutations([]);
+    setImages({});
+    setImagePrompts({});
+    setSelectedDayIndex(-1);
+  }, [timeline]);
+
+  const handleSelectScenario = useCallback((id: string) => {
+    if (id !== selectedScenarioId) {
+      if (timeline !== '' && !window.confirm("Смена сценария приведет к сбросу текущей игры. Продолжить?")) {
+        return;
+      }
+      setSelectedScenarioId(id);
+      handleResetGame(false);
+    }
+  }, [selectedScenarioId, timeline, handleResetGame]);
 
   const handleAddScenario = useCallback(() => {
     const newId = `scen_${Date.now()}`;
@@ -128,46 +190,18 @@ export default function App() {
       symptoms: ''
     };
     setScenarios(prev => [...prev, newScenario]);
-    setSelectedScenarioId(newId);
+    handleSelectScenario(newId);
     return newId;
-  }, []);
+  }, [handleSelectScenario]);
 
   const handleDeleteScenario = useCallback((id: string) => {
     setScenarios(prev => {
       if (prev.length <= 1) return prev;
       const filtered = prev.filter(s => s.id !== id);
-      if (selectedScenarioId === id) setSelectedScenarioId(filtered[0].id);
+      if (selectedScenarioId === id) handleSelectScenario(filtered[0].id);
       return filtered;
     });
-  }, [selectedScenarioId]);
-  
-  const [timeline, setTimeline] = useState<string>('');
-  const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({});
-  const [isSimulating, setIsSimulating] = useState(false);
-  const [isImageGenerating, setIsImageGenerating] = useState(false);
-  const [stepAmount, setStepAmount] = useState('3 дня');
-  const [eventFrequency, setEventFrequency] = useState('3 часа');
-  const [images, setImages] = useState<Record<number, string>>({});
-  const [imagePrompts, setImagePrompts] = useState<Record<number, string>>({});
-  const [mainView, setMainView] = useState<'split' | 'map' | 'chat'>('split');
-  
-  // Settings loaded from profile (lazy-init to avoid calling getUserSettings every render)
-  const [imageMode, setImageMode] = useState<'on' | 'off' | 'prompt'>(() => getUserSettings().imageMode);
-  const [textProvider, setTextProvider] = useState<'gemini' | 'openai' | 'openrouter'>(() => getUserSettings().textProvider);
-  const [textModel, setTextModel] = useState(() => getUserSettings().textModel);
-  const [imageModel, setImageModel] = useState(() => getUserSettings().imageModel);
-  const [openAiKey, setOpenAiKey] = useState(() => getUserSettings().openAiKey);
-  const [openRouterKey, setOpenRouterKey] = useState(() => getUserSettings().openRouterKey);
-  const [showMapOverlay, setShowMapOverlay] = useState(() => getUserSettings().showMapOverlay);
-  const [symptomPhases, setSymptomPhases] = useState<SymptomPhase[]>(() => getUserSettings().symptomPhases || DEFAULT_SYMPTOM_PHASES);
-  const [textScale, setTextScale] = useState<number>(() => getUserSettings().textScale ?? 1.0);
-  
-  // Mutation states
-  const [mutationPoints, setMutationPoints] = useState<number>(() => getUserSettings().mutationPoints ?? 50);
-  const [activeMutations, setActiveMutations] = useState<any[]>(() => getUserSettings().mutations || []);
-  const [mutationProposal, setMutationProposal] = useState('');
-  const [evaluationResult, setEvaluationResult] = useState<{ approved: boolean; cost: number; reason: string; name: string } | null>(null);
-  const [isEvaluating, setIsEvaluating] = useState(false);
+  }, [selectedScenarioId, handleSelectScenario]);
 
   const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -181,7 +215,97 @@ export default function App() {
     }, 5000);
   }, []);
 
-  // Auto-save settings whenever they change
+  const compileSaveData = useCallback((): GameSave => {
+    return {
+      timeline,
+      mapSnapshots,
+      mutationPoints,
+      activeMutations,
+      symptomPhases,
+      startDate,
+      location,
+      selectedScenarioId,
+      scenarios,
+      images,
+      imagePrompts,
+      lastUpdated: new Date().toISOString()
+    };
+  }, [timeline, mapSnapshots, mutationPoints, activeMutations, symptomPhases, startDate, location, selectedScenarioId, scenarios, images, imagePrompts]);
+
+  const applySaveData = useCallback((save: GameSave) => {
+    setTimeline(save.timeline || '');
+    setMapSnapshots(save.mapSnapshots || {});
+    setMutationPoints(save.mutationPoints ?? 80);
+    setActiveMutations(save.activeMutations || []);
+    setSymptomPhases(save.symptomPhases || DEFAULT_SYMPTOM_PHASES);
+    setStartDate(save.startDate || '1989-07-03');
+    setLocation(save.location || [39.8283, -98.5795]);
+    setSelectedScenarioId(save.selectedScenarioId || 'default_zombie');
+    if (save.scenarios) setScenarios(save.scenarios);
+    setImages(save.images || {});
+    setImagePrompts(save.imagePrompts || {});
+    setSelectedDayIndex(-1);
+    addNotification('Прогресс игры успешно загружен', 'info');
+  }, [addNotification]);
+
+  const handleSaveGameLocal = useCallback(() => {
+    try {
+      const saveData = compileSaveData();
+      saveGame(saveData);
+      addNotification('Игра сохранена в браузере', 'info');
+    } catch (e: any) {
+      addNotification('Ошибка сохранения: ' + e.message, 'error');
+    }
+  }, [compileSaveData, addNotification]);
+
+  const handleLoadGameLocal = useCallback(() => {
+    const save = loadGame();
+    if (save) {
+      if (timeline !== '' && !window.confirm("Загрузка перезапишет текущий прогресс. Продолжить?")) return;
+      applySaveData(save);
+    } else {
+      addNotification('Сохранение не найдено', 'warning');
+    }
+  }, [timeline, applySaveData, addNotification]);
+
+  const handleExportGameFile = useCallback(() => {
+    try {
+      const saveData = compileSaveData();
+      const blob = new Blob([JSON.stringify(saveData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `projectz_save_${new Date().toISOString().split('T')[0]}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      addNotification('Файл сохранения экспортирован', 'info');
+    } catch (e: any) {
+      addNotification('Ошибка экспорта: ' + e.message, 'error');
+    }
+  }, [compileSaveData, addNotification]);
+
+  const handleImportGameFile = useCallback(() => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = (e: any) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (re) => {
+        try {
+          const save = JSON.parse(re.target?.result as string);
+          if (timeline !== '' && !window.confirm("Импорт файла перезапишет текущий прогресс. Продолжить?")) return;
+          applySaveData(save);
+        } catch (err: any) {
+          addNotification('Ошибка импорта: неверный формат файла', 'error');
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }, [timeline, applySaveData, addNotification]);
+
   useEffect(() => {
     if (!isAuthed) return;
     const settings: UserSettings = {
@@ -198,96 +322,66 @@ export default function App() {
   const parsedEvents = useMemo(() => {
     const events: TimelineEvent[] = [];
     const headerRegex = new RegExp(DAY_HEADER_REGEX);
-    
-    // Find all matches for DAY_X
     const matches = Array.from(timeline.matchAll(headerRegex));
 
     for (let i = 0; i < matches.length; i++) {
       const match = matches[i];
       const dayNum = parseInt(match[1], 10);
       const dateStr = match[2] || `DAY_${dayNum}`;
-      
       const headerStartIndex = match.index;
       const nextMatchIndex = i + 1 < matches.length ? matches[i + 1].index : timeline.length;
-      
-      // The text of this day starts after its header and ends before the next day's header
       let rawText = timeline.substring(headerStartIndex + match[0].length, nextMatchIndex).trim();
 
-      // Process MAP_DATA if it exists within this day's block
       let mapData = undefined;
       const mapStartIndex = rawText.indexOf('[MAP_DATA:');
       if (mapStartIndex !== -1) {
         const jsonStart = rawText.indexOf('{', mapStartIndex);
         let mapEndIndex = rawText.lastIndexOf(']');
-
-        if (mapEndIndex < mapStartIndex) {
-          mapEndIndex = rawText.length;
-        }
-
+        if (mapEndIndex < mapStartIndex) mapEndIndex = rawText.length;
         if (jsonStart !== -1) {
           const jsonEnd = rawText.lastIndexOf('}');
           if (jsonEnd !== -1 && jsonEnd >= jsonStart) {
             const jsonStr = rawText.substring(jsonStart, jsonEnd + 1);
             try {
               mapData = JSON.parse(jsonStr);
-              // Clean up the text by removing the technical block
               rawText = rawText.substring(0, mapStartIndex).trim() + '\n' + rawText.substring(mapEndIndex + 1).trim();
-            } catch (e) {
-              // Ignore parse errors
-            }
+            } catch (e) {}
           }
         }
       }
 
-      events.push({
-        day: dayNum,
-        dateStr: dateStr,
-        text: rawText,
-        mapData: mapData,
-        raw: match[0] + rawText,
-      });
+      events.push({ day: dayNum, dateStr: dateStr, text: rawText, mapData: mapData, raw: match[0] + rawText });
     }
 
-    // Deduplicate: keep the last version of each day (important for streaming)
     const latestEventsMap = new Map<number, TimelineEvent>();
-    for (const ev of events) {
-      latestEventsMap.set(ev.day, ev);
-    }
-
+    for (const ev of events) latestEventsMap.set(ev.day, ev);
     const deduped = Array.from(latestEventsMap.values());
     deduped.sort((a, b) => a.day - b.day);
-    
     return deduped;
   }, [timeline]);
-
-  const [selectedDayIndex, setSelectedDayIndex] = useState<number>(-1);
 
   useEffect(() => {
     if (parsedEvents.length > 0 && selectedDayIndex === -1) {
       setSelectedDayIndex(0);
     } else if (isSimulating && parsedEvents.length > 0) {
-      // During simulation, always follow the latest day being generated
       setSelectedDayIndex(parsedEvents.length - 1);
     } else if (!isSimulating && parsedEvents.length > 0 && selectedDayIndex === parsedEvents.length - 2) {
-      // Auto-advance to the newly generated day only when generation completes, 
-      // and only if the user was on the previous day (meaning they were following along).
       setSelectedDayIndex(parsedEvents.length - 1);
     }
   }, [parsedEvents.length, isSimulating]);
 
   const startSimulationStep = async () => {
     setIsSimulating(true);
-    // If it's the first time, reset timeline. Otherwise, append
     if (parsedEvents.length === 0) {
       setTimeline('');
       setMapSnapshots({});
+      setMutationPoints(80);
+      setActiveMutations([]);
     }
     
-    // Determine current elapsed context
     const lastEvent = parsedEvents.length > 0 ? parsedEvents[parsedEvents.length - 1] : null;
     const elapsedDays = lastEvent ? lastEvent.day : 0;
     
-    // Calculate the date for the next day
     let nextDateStr = startDate;
     if (lastEvent) {
         try {
@@ -297,7 +391,6 @@ export default function App() {
                 nextDate.setDate(nextDate.getDate() + 1);
                 nextDateStr = nextDate.toISOString().split('T')[0];
             } else {
-                // Fallback to day count if date parsing fails
                 nextDateStr = `День ${elapsedDays + 1}`;
             }
         } catch (e) {
@@ -335,21 +428,10 @@ export default function App() {
 
       let newTimelineChunk = "";
       for await (const chunk of stream) {
-        setTimeline(prev => {
-          const updated = prev + chunk;
-          // Check if a new DAY_ header was just added
-          const headerRegex = new RegExp(DAY_HEADER_REGEX);
-          const matches = Array.from(updated.matchAll(headerRegex));
-          if (matches.length > 0) {
-            // If the number of days increased, we might want to switch view
-            // (Note: parsedEvents is updated via useMemo, but we can trigger state change here)
-          }
-          return updated;
-        });
+        setTimeline(prev => prev + chunk);
         newTimelineChunk += chunk;
       }
 
-      // Check the newly parsed events from the chunk
       const regex = /DAY_(\d+)/g;
       let match;
       let lastDayInChunk = -1;
@@ -374,8 +456,6 @@ export default function App() {
               setImagePrompts(prev => ({...prev, [lastDayInChunk]: prompt}));
           }
 
-          // Generate Mutation Points
-          // Logic: 10 points per step + logarithmic bonus for total zombies
           const daysGenerated = lastDayInChunk - elapsedDays;
           if (daysGenerated > 0) {
               const basePoints = daysGenerated * 10;
@@ -392,11 +472,6 @@ export default function App() {
     }
   };
 
-  // Removed automatic scrolling to bottom during generation to allow user to read at their own pace
-  useEffect(() => {
-    // We could scroll to top when selectedDayIndex changes if needed, but for now we'll just prevent jumping.
-  }, [selectedDayIndex]);
-
   const currentDayMapData = useMemo(() => {
     if (!parsedEvents || parsedEvents.length === 0 || selectedDayIndex < 0) return undefined;
     return buildMapDataSnapshot(parsedEvents, selectedDayIndex, mapSnapshots);
@@ -411,7 +486,6 @@ export default function App() {
 
   const displayTimelineText = useMemo(() => {
     if (!currentEvent) return '';
-    // Extra safety to strip technical blocks that might have leaked into currentEvent.text
     return currentEvent.text.replace(/\[MAP_DATA:[\s\S]*?\]/g, "").trim();
   }, [currentEvent]);
 
@@ -478,13 +552,14 @@ export default function App() {
 
   return (
     <div className="bg-[#050505] text-[#A3A3A3] w-full h-screen font-mono flex flex-col select-none">
+      <Suspense fallback={<LoadingUI />}>
       {isMainMenu ? (
         isScenarioSelectOpen ? (
           <ScenarioSelectScreen
             scenarios={scenarios}
             selectedScenarioId={selectedScenarioId}
             activeScenario={activeScenario}
-            onSelectScenario={setSelectedScenarioId}
+            onSelectScenario={handleSelectScenario}
             onAddScenario={handleAddScenario}
             onDeleteScenario={handleDeleteScenario}
             onUpdateScenario={updateScenario}
@@ -493,6 +568,7 @@ export default function App() {
               setIsRoleSelectOpen(true);
             }}
             onContinue={() => {
+              handleResetGame(false);
               setIsScenarioSelectOpen(false);
               setIsRoleSelectOpen(false);
               setIsMainMenu(false);
@@ -544,8 +620,59 @@ export default function App() {
              <button onClick={() => setMainView('chat')} className={`px-2 md:px-3 py-1 text-[10px] uppercase font-bold transition-colors ${mainView === 'chat' ? 'bg-[#333] text-white' : 'text-[#555] hover:text-[#A3A3A3]'}`}>Chat</button>
           </div>
           <button 
-            onClick={() => setIsSettingsOpen(true)}
+            onClick={() => setIsMainMenu(true)}
             className="flex items-center gap-2 text-[#555] hover:text-white transition-colors xl:border-l border-[#333] xl:pl-8"
+          >
+            <ChevronLeft className="w-5 h-5 md:w-4 md:h-4" />
+            <span className="text-[10px] uppercase tracking-widest font-bold hidden md:inline">Menu</span>
+          </button>
+          <button 
+            onClick={() => handleResetGame()}
+            className="flex items-center gap-2 text-[#555] hover:text-red-500 transition-colors border-l border-[#333] pl-4 md:pl-8"
+            title="Сбросить прогресс игры"
+          >
+            <RotateCcw className="w-5 h-5 md:w-4 md:h-4" />
+            <span className="text-[10px] uppercase tracking-widest font-bold hidden md:inline">Reset</span>
+          </button>
+          
+          <div className="flex items-center border-l border-[#333] ml-4 md:ml-8 pl-4 md:pl-8 gap-2 md:gap-4">
+            <button 
+              onClick={handleSaveGameLocal}
+              className="flex items-center gap-2 text-[#555] hover:text-white transition-colors"
+              title="Сохранить в браузер"
+            >
+              <Save className="w-5 h-5 md:w-4 md:h-4" />
+              <span className="text-[10px] uppercase tracking-widest font-bold hidden lg:inline">Save</span>
+            </button>
+            <button 
+              onClick={handleLoadGameLocal}
+              className="flex items-center gap-2 text-[#555] hover:text-white transition-colors"
+              title="Загрузить из браузера"
+            >
+              <Upload className="w-5 h-5 md:w-4 md:h-4" />
+              <span className="text-[10px] uppercase tracking-widest font-bold hidden lg:inline">Load</span>
+            </button>
+            <button 
+              onClick={handleExportGameFile}
+              className="flex items-center gap-2 text-[#555] hover:text-white transition-colors"
+              title="Экспорт в файл"
+            >
+              <Download className="w-5 h-5 md:w-4 md:h-4" />
+              <span className="text-[10px] uppercase tracking-widest font-bold hidden xl:inline">Export</span>
+            </button>
+            <button 
+              onClick={handleImportGameFile}
+              className="flex items-center gap-2 text-[#555] hover:text-white transition-colors"
+              title="Импорт из файла"
+            >
+              <Upload className="w-5 h-5 md:w-4 md:h-4 rotate-180" />
+              <span className="text-[10px] uppercase tracking-widest font-bold hidden xl:inline">Import</span>
+            </button>
+          </div>
+
+          <button 
+            onClick={() => setIsSettingsOpen(true)}
+            className="flex items-center gap-2 text-[#555] hover:text-white transition-colors border-l border-[#333] pl-4 md:pl-8"
           >
             <Settings className="w-5 h-5 md:w-4 md:h-4" />
             <span className="text-[10px] uppercase tracking-widest font-bold hidden md:inline">Settings</span>
@@ -620,6 +747,7 @@ export default function App() {
             <div className="absolute inset-0 opacity-10 pointer-events-none z-10" style={{ backgroundImage: 'radial-gradient(#333 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
             
             <div className={`w-full ${imageMode === 'off' ? 'h-full' : 'h-1/2'} relative bg-[#0a0a0a] border-b border-[#333]`}>
+               <Suspense fallback={<LoadingUI />}>
                <MapView 
                  location={location} 
                  setLocation={setLocation} 
@@ -627,6 +755,7 @@ export default function App() {
                  showOverlay={showMapOverlay} 
                  isLocked={isSimulating || parsedEvents.length > 0}
                />
+               </Suspense>
                {/* Map overlay toggle */}
                <button
                  onClick={() => setShowMapOverlay(prev => !prev)}
@@ -756,7 +885,9 @@ export default function App() {
             
             {(parsedEvents.length === 0 && timeline) && (
                <div className="markdown-body whitespace-pre-wrap prose prose-invert prose-p:my-2 prose-sm max-w-none prose-strong:text-orange-500 timeline-glow text-[#A3A3A3] text-[11px]">
+                 <Suspense fallback={<Loader2 className="w-4 h-4 animate-spin" />}>
                  <ReactMarkdown>{timeline}</ReactMarkdown>
+                 </Suspense>
                </div>
             )}
 
@@ -766,7 +897,9 @@ export default function App() {
                  <div className="flex flex-col w-full">
                    <span className="text-[9px] uppercase text-[#777] mb-1 tracking-wider">{parsedEvents[selectedDayIndex].dateStr}</span>
                    <div className="markdown-body whitespace-pre-wrap prose prose-invert prose-p:my-1 prose-sm max-w-none text-[11px] leading-relaxed text-[#E0E0E0]">
+                     <Suspense fallback={<Loader2 className="w-4 h-4 animate-spin" />}>
                      <ReactMarkdown>{displayTimelineText}</ReactMarkdown>
+                     </Suspense>
                    </div>
                  </div>
               </div>
@@ -1318,344 +1451,7 @@ export default function App() {
           </div>
         ))}
       </div>
+      </Suspense>
     </div>
-  );
-}
-
-interface ScenarioSelectScreenProps {
-  scenarios: Scenario[];
-  selectedScenarioId: string;
-  activeScenario: Scenario;
-  onSelectScenario: (id: string) => void;
-  onAddScenario: () => string;
-  onDeleteScenario: (id: string) => void;
-  onUpdateScenario: (id: string, field: keyof Scenario, value: string) => void;
-  onBack: () => void;
-  onContinue: () => void;
-}
-
-function ScenarioSelectScreen({
-  scenarios,
-  selectedScenarioId,
-  activeScenario,
-  onSelectScenario,
-  onAddScenario,
-  onDeleteScenario,
-  onUpdateScenario,
-  onBack,
-  onContinue,
-}: ScenarioSelectScreenProps) {
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const editingScenario = scenarios.find(s => s.id === editingId) || null;
-
-  useEffect(() => {
-    if (editingId && !scenarios.some(s => s.id === editingId)) {
-      setEditingId(null);
-    }
-  }, [editingId, scenarios]);
-
-  const beginCreateScenario = () => {
-    const newId = onAddScenario();
-    setEditingId(newId);
-  };
-
-  const beginEditScenario = (id: string) => {
-    onSelectScenario(id);
-    setEditingId(id);
-  };
-
-  const detailSections = [
-    {
-      title: 'Предисловие',
-      text: activeScenario.preface,
-      empty: 'Предисловие пока не задано.',
-    },
-    {
-      title: 'Начало вируса',
-      text: activeScenario.origin,
-      empty: 'Начало сценария можно описать в редакторе.',
-    },
-    {
-      title: 'Особенности вируса',
-      text: activeScenario.symptoms,
-      empty: 'Особенности вируса пока не заданы.',
-    },
-  ];
-
-  return (
-    <section
-      className="scenario-selector-screen main-menu-screen relative flex-1 overflow-hidden text-white"
-      style={{
-        backgroundImage: `url(${menuBackground})`,
-      }}
-    >
-      <div className="menu-hex-grid" />
-      <div className="menu-scanline" />
-
-      <div className="absolute left-4 top-4 z-20 text-[10px] uppercase tracking-[0.3em] text-red-100/45">
-        Project Z / Scenario Selection
-      </div>
-
-      <div className="scenario-radar absolute left-1/2 top-1/2 hidden -translate-x-1/2 -translate-y-1/2 items-center justify-center md:flex">
-        <div className="scenario-radar-ring scenario-radar-ring-outer" />
-        <div className="scenario-radar-ring scenario-radar-ring-mid" />
-        <div className="scenario-radar-core">
-          <Biohazard className="h-[18vmin] w-[18vmin] text-red-100/78 drop-shadow-[0_0_38px_rgba(255,180,180,0.9)]" strokeWidth={1.35} />
-        </div>
-      </div>
-
-      <div className="relative z-10 grid h-full grid-rows-[1fr_auto] px-4 pb-4 pt-16 sm:px-6 lg:px-8">
-        <div className="scenario-selection-layout grid min-h-0 gap-5 lg:grid-cols-[minmax(260px,380px)_minmax(0,1fr)]">
-          <div className="scenario-list-panel min-h-0">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <div>
-                <div className="text-[10px] uppercase tracking-[0.26em] text-red-200/54">База сценариев</div>
-                <div className="mt-1 text-sm font-bold uppercase text-white/88">Выбор угрозы</div>
-              </div>
-              <button className="scenario-small-action" onClick={beginCreateScenario}>
-                <Plus className="h-4 w-4" />
-                <span>Создать</span>
-              </button>
-            </div>
-
-            <div className="scenario-list-scroll">
-              {scenarios.map((scenario) => {
-                const isActive = scenario.id === selectedScenarioId;
-                return (
-                  <button
-                    key={scenario.id}
-                    className={`scenario-choice-card ${isActive ? 'scenario-choice-card-active' : ''}`}
-                    onClick={() => onSelectScenario(scenario.id)}
-                  >
-                    <span className="scenario-choice-lines" />
-                    <span className="min-w-0 flex-1 text-right">
-                      <span className="block truncate text-xl font-bold leading-tight">{scenario.name || 'Без названия'}</span>
-                      <span className="mt-1 line-clamp-2 block text-xs leading-snug text-red-50/66">
-                        {scenario.preface || scenario.origin || 'Пользовательский сценарий'}
-                      </span>
-                    </span>
-                    <span className="scenario-choice-icon">
-                      <Biohazard className="h-10 w-10" strokeWidth={1.8} />
-                    </span>
-                    <span
-                      className="scenario-choice-edit"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        beginEditScenario(scenario.id);
-                      }}
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="scenario-detail-panel min-h-0">
-            <div className="scenario-detail-header">
-              <div>
-                <div className="text-[10px] uppercase tracking-[0.28em] text-red-200/60">Выбранный сценарий</div>
-                <h1>{activeScenario.name || 'Без названия'}</h1>
-              </div>
-              <button className="scenario-small-action scenario-edit-active" onClick={() => beginEditScenario(activeScenario.id)}>
-                <Pencil className="h-4 w-4" />
-                <span>Изменить</span>
-              </button>
-            </div>
-
-            <div className="scenario-detail-scroll">
-              {detailSections.map(section => (
-                <section key={section.title} className="scenario-detail-section">
-                  <h2>{section.title}</h2>
-                  <p>{section.text || section.empty}</p>
-                </section>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="scenario-bottom-bar scenario-bottom-bar-simple">
-          <button className="scenario-nav-button scenario-nav-button-left" onClick={onBack}>
-            <ChevronLeft className="h-6 w-6" />
-            <span>Назад</span>
-          </button>
-
-          <button className="scenario-nav-button scenario-nav-button-right" onClick={onContinue}>
-            <span>Продолжить</span>
-            <ChevronRight className="h-6 w-6" />
-          </button>
-        </div>
-      </div>
-
-      {editingScenario && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/72 p-4 backdrop-blur-sm">
-          <div className="scenario-editor w-full max-w-3xl">
-            <button
-              onClick={() => setEditingId(null)}
-              className="absolute right-5 top-5 text-red-100/55 transition-colors hover:text-white"
-              aria-label="Закрыть редактор"
-            >
-              <X className="h-5 w-5" />
-            </button>
-            <div className="mb-5 pr-10">
-              <div className="text-[10px] uppercase tracking-[0.28em] text-red-300/60">Редактор сценария</div>
-              <h2 className="mt-2 text-2xl font-bold uppercase tracking-wide text-white">Пользовательский сценарий</h2>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <label className="scenario-editor-field md:col-span-2">
-                <span>Название</span>
-                <input
-                  value={editingScenario.name}
-                  onChange={e => onUpdateScenario(editingScenario.id, 'name', e.target.value)}
-                  placeholder="Название сценария"
-                />
-              </label>
-              <label className="scenario-editor-field md:col-span-2">
-                <span>Предисловие</span>
-                <textarea
-                  rows={3}
-                  value={editingScenario.preface}
-                  onChange={e => onUpdateScenario(editingScenario.id, 'preface', e.target.value)}
-                  placeholder="Общий контекст: эпоха, страна, тон истории"
-                />
-              </label>
-              <label className="scenario-editor-field">
-                <span>Начало</span>
-                <textarea
-                  rows={6}
-                  value={editingScenario.origin}
-                  onChange={e => onUpdateScenario(editingScenario.id, 'origin', e.target.value)}
-                  placeholder="Где и почему начинается заражение"
-                />
-              </label>
-              <label className="scenario-editor-field">
-                <span>Особенности</span>
-                <textarea
-                  rows={6}
-                  value={editingScenario.symptoms}
-                  onChange={e => onUpdateScenario(editingScenario.id, 'symptoms', e.target.value)}
-                  placeholder="Симптомы, передача, ограничения и правила"
-                />
-              </label>
-            </div>
-            <div className="mt-5 flex items-center justify-between gap-3 border-t border-red-500/25 pt-4">
-              <button
-                className="scenario-editor-danger"
-                onClick={() => onDeleteScenario(editingScenario.id)}
-                disabled={scenarios.length <= 1}
-              >
-                <Trash2 className="h-4 w-4" />
-                <span>Удалить</span>
-              </button>
-              <button className="scenario-editor-save" onClick={() => setEditingId(null)}>
-                <Check className="h-4 w-4" />
-                <span>Готово</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-interface MainMenuScreenProps {
-  username: string;
-  isRoleSelectOpen: boolean;
-  onOpenRoleSelect: () => void;
-  onCloseRoleSelect: () => void;
-  onStartVirusGame: () => void;
-  onOpenSettings: () => void;
-  onLogout: () => void;
-}
-
-function MainMenuScreen({
-  username,
-  isRoleSelectOpen,
-  onOpenRoleSelect,
-  onCloseRoleSelect,
-  onStartVirusGame,
-  onOpenSettings,
-  onLogout,
-}: MainMenuScreenProps) {
-  return (
-    <section
-      className="main-menu-screen relative flex-1 overflow-hidden text-white"
-      style={{
-        backgroundImage: `url(${menuBackground})`,
-      }}
-    >
-      <div className="menu-hex-grid" />
-      <div className="menu-scanline" />
-
-      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-        <Biohazard className="w-[34vmin] h-[34vmin] text-red-500/18 drop-shadow-[0_0_42px_rgba(255,0,52,0.42)]" strokeWidth={1.2} />
-      </div>
-
-      <div className="absolute left-4 right-4 top-4 z-20 flex items-start gap-4">
-        <div className="text-[10px] uppercase tracking-[0.3em] text-red-100/45">
-          Project Z / Main Interface
-        </div>
-      </div>
-
-      <div className="relative z-10 flex h-full items-end justify-between gap-6 px-4 pb-4 pt-20 sm:px-6 lg:px-8">
-        <aside className="menu-panel w-full max-w-[360px]">
-          <div className="menu-panel-title">
-            <span>Главное меню</span>
-          </div>
-          <div className="space-y-5 px-6 py-7">
-            <button className="menu-action-button" onClick={onOpenRoleSelect}>
-              <Play className="w-5 h-5" />
-              <span>Игра</span>
-            </button>
-            <button className="menu-action-button" onClick={onOpenSettings}>
-              <Settings className="w-5 h-5" />
-              <span>Настройки</span>
-            </button>
-          </div>
-          <div className="flex items-center justify-between border-t border-red-500/30 px-6 py-4 text-[10px] uppercase tracking-[0.2em] text-red-100/50">
-            <span>{username || 'Operator'}</span>
-            <button
-              onClick={onLogout}
-              className="flex items-center gap-2 text-red-100/50 transition-colors hover:text-red-100"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>Выход</span>
-            </button>
-          </div>
-        </aside>
-      </div>
-
-      {isRoleSelectOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-          <div className="role-dialog w-full max-w-xl">
-            <button
-              onClick={onCloseRoleSelect}
-              className="absolute right-4 top-4 text-red-100/55 transition-colors hover:text-white"
-              aria-label="Закрыть"
-            >
-              <X className="w-5 h-5" />
-            </button>
-            <div className="mb-6 pr-10">
-              <div className="text-[10px] uppercase tracking-[0.28em] text-red-300/60">Режим запуска</div>
-              <h2 className="mt-2 text-2xl font-bold uppercase tracking-wide text-white">Выбор стороны</h2>
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <button className="role-choice role-choice-ready" onClick={onStartVirusGame}>
-                <Biohazard className="w-9 h-9 text-red-300" />
-                <span>За вирус</span>
-                <small>Реализовано</small>
-              </button>
-              <button className="role-choice role-choice-disabled" disabled>
-                <UserRound className="w-9 h-9 text-cyan-200" />
-                <span>За человека</span>
-                <small>Пока не реализовано</small>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </section>
   );
 }
