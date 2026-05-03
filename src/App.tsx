@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense } fro
 import { AuthScreen } from './components/AuthScreen';
 import { simulateOutbreakStepStream, generateCityImage, buildCityImagePrompt, evaluateMutationProposal } from './lib/gemini';
 import { buildTerrainContext } from './lib/geoContext';
-import { getSessionUsername, getUserSettings, saveUserSettings, logoutUser, saveGame, loadGame, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS, type GameSave } from './lib/auth';
+import { getSessionUsername, getSessionToken, fetchCurrentUser, getUserSettings, saveUserSettings, logoutUser, saveGame, loadGame, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS, type GameSave, type Mutation } from './lib/auth';
 import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, UserRound, Skull, Microscope, Dna, Save, Upload, Download } from 'lucide-react';
 
 // Lazy load heavy components
@@ -79,11 +79,53 @@ const LoadingUI = () => (
 );
 
 export default function App() {
-  // Initialize settings once
-  const initialSettings = useMemo(() => getUserSettings(), []);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [isAuthed, setIsAuthed] = useState(false);
+  const [currentUsername, setCurrentUsername] = useState('');
 
-  const [isAuthed, setIsAuthed] = useState(() => !!getSessionUsername());
-  const [currentUsername, setCurrentUsername] = useState(() => getSessionUsername() || '');
+  useEffect(() => {
+    async function init() {
+      if (getSessionToken()) {
+        const user = await fetchCurrentUser();
+        if (user) {
+          setIsAuthed(true);
+          setCurrentUsername(user.username);
+        } else {
+          setIsAuthed(false);
+        }
+      }
+      setIsInitializing(false);
+    }
+    init();
+  }, []);
+
+
+
+  useEffect(() => {
+    if (!isInitializing && isAuthed) {
+      const settings = getUserSettings();
+      setTextProvider(settings.textProvider);
+      setTextModel(settings.textModel);
+      setImageModel(settings.imageModel);
+      setImageMode(settings.imageMode);
+      setGeminiKey(settings.geminiKey || '');
+      setOpenAiKey(settings.openAiKey);
+      setOpenRouterKey(settings.openRouterKey);
+      setShowMapOverlay(settings.showMapOverlay);
+      setSymptomPhases(settings.symptomPhases || DEFAULT_SYMPTOM_PHASES);
+      setScenarios(settings.scenarios || DEFAULT_SCENARIOS);
+      setSelectedScenarioId(settings.selectedScenarioId || 'default_zombie');
+      setMutationPoints(settings.mutationPoints ?? 80);
+      setActiveMutations(settings.mutations || []);
+      if (settings.textScale) setTextScale(settings.textScale);
+    }
+  }, [isInitializing, isAuthed]);
+
+  if (isInitializing) {
+    return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">Loading...</div>;
+  }
+
+
   const [isMainMenu, setIsMainMenu] = useState(true);
   const [isRoleSelectOpen, setIsRoleSelectOpen] = useState(false);
   const [isScenarioSelectOpen, setIsScenarioSelectOpen] = useState(false);
@@ -119,40 +161,48 @@ export default function App() {
     setIsScenarioSelectOpen(false);
   }, []);
 
-  const [location, setLocation] = useState<[number, number]>([39.8283, -98.5795]); 
-  const [startDate, setStartDate] = useState('1989-07-03');
-  const [scenarios, setScenarios] = useState<Scenario[]>(initialSettings.scenarios || DEFAULT_SCENARIOS);
-  const [selectedScenarioId, setSelectedScenarioId] = useState<string>(initialSettings.selectedScenarioId || 'default_zombie');
-  
-  const activeScenario = useMemo(() => scenarios.find(s => s.id === selectedScenarioId) || scenarios[0] || DEFAULT_SCENARIOS[0], [scenarios, selectedScenarioId]);
+  const [location, setLocation] = useState<[number, number]>([55.7558, 37.6173]);
+  const [startDate, setStartDate] = useState(new Date().toISOString().split('T')[0]);
+  const [scenarios, setScenarios] = useState<Scenario[]>(DEFAULT_SCENARIOS);
+  const [selectedScenarioId, setSelectedScenarioId] = useState<string>('default_zombie');
+  const activeScenario = useMemo(() => scenarios.find(s => s.id === selectedScenarioId) || scenarios[0], [scenarios, selectedScenarioId]);
 
   const updateScenario = useCallback((id: string, field: keyof Scenario, value: string) => {
     setScenarios(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s));
   }, []);
 
-  const [timeline, setTimeline] = useState<string>('');
-  const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({});
-  const [isSimulating, setIsSimulating] = useState(false);
+  const [mainView, setMainView] = useState<'map' | 'timeline' | 'split' | 'chat'>('map');
   const [isImageGenerating, setIsImageGenerating] = useState(false);
-  const [stepAmount, setStepAmount] = useState('3 дня');
-  const [eventFrequency, setEventFrequency] = useState('3 часа');
+
+  const [stepAmount, setStepAmount] = useState('1 день');
+  const [eventFrequency, setEventFrequency] = useState('на твое усмотрение');
+  const [elapsedDays, setElapsedDays] = useState(0);
+  const [timeline, setTimeline] = useState('');
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [mapSnapshots, setMapSnapshots] = useState<Record<number, any>>({ 0: null });
   const [images, setImages] = useState<Record<number, string>>({});
   const [imagePrompts, setImagePrompts] = useState<Record<number, string>>({});
-  const [mainView, setMainView] = useState<'split' | 'map' | 'chat'>('split');
+  const [mutationPoints, setMutationPoints] = useState(50);
+  const [activeMutations, setActiveMutations] = useState<Mutation[]>([]);
+
+  // Map controls
+  const [selectedDay, setSelectedDay] = useState<number>(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playSpeed, setPlaySpeed] = useState(1);
+
+  // Settings state
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [imageMode, setImageMode] = useState<'on' | 'off' | 'prompt'>('off');
+  const [textProvider, setTextProvider] = useState<'gemini' | 'openai' | 'openrouter'>('gemini');
+  const [textModel, setTextModel] = useState('gemini-3.1-pro-preview');
+  const [imageModel, setImageModel] = useState('imagen-3.0-generate-002');
+  const [geminiKey, setGeminiKey] = useState('');
+  const [openAiKey, setOpenAiKey] = useState('');
+  const [openRouterKey, setOpenRouterKey] = useState('');
+  const [showMapOverlay, setShowMapOverlay] = useState(true);
+  const [symptomPhases, setSymptomPhases] = useState<SymptomPhase[]>(DEFAULT_SYMPTOM_PHASES);
+  const [textScale, setTextScale] = useState<number>(1.0);
   
-  const [imageMode, setImageMode] = useState<'on' | 'off' | 'prompt'>(initialSettings.imageMode);
-  const [textProvider, setTextProvider] = useState<'gemini' | 'openai' | 'openrouter'>(initialSettings.textProvider);
-  const [textModel, setTextModel] = useState(initialSettings.textModel);
-  const [imageModel, setImageModel] = useState(initialSettings.imageModel);
-  const [geminiKey, setGeminiKey] = useState(initialSettings.geminiKey || '');
-  const [openAiKey, setOpenAiKey] = useState(initialSettings.openAiKey);
-  const [openRouterKey, setOpenRouterKey] = useState(initialSettings.openRouterKey);
-  const [showMapOverlay, setShowMapOverlay] = useState(initialSettings.showMapOverlay);
-  const [symptomPhases, setSymptomPhases] = useState<SymptomPhase[]>(initialSettings.symptomPhases || DEFAULT_SYMPTOM_PHASES);
-  const [textScale, setTextScale] = useState<number>(initialSettings.textScale ?? 1.0);
-  
-  const [mutationPoints, setMutationPoints] = useState<number>(80);
-  const [activeMutations, setActiveMutations] = useState<any[]>([]);
   const [mutationProposal, setMutationProposal] = useState('');
   const [evaluationResult, setEvaluationResult] = useState<{ approved: boolean; cost: number; reason: string; name: string } | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
@@ -206,7 +256,7 @@ export default function App() {
   }, [selectedScenarioId, handleSelectScenario]);
 
   const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
   const [notifications, setNotifications] = useState<Notification[]>([]);
 
   const addNotification = useCallback((message: string, type: Notification['type'] = 'info') => {
