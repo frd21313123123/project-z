@@ -47,6 +47,7 @@ export interface UserSettings {
   textModel: string;
   imageModel: string;
   imageMode: 'on' | 'off' | 'prompt';
+  geminiKey: string;
   openAiKey: string;
   openRouterKey: string;
   showMapOverlay: boolean;
@@ -87,6 +88,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   textModel: 'gemini-3.1-pro-preview',
   imageModel: 'imagen-3.0-generate-002',
   imageMode: 'on',
+  geminiKey: '',
   openAiKey: '',
   openRouterKey: '',
   showMapOverlay: true,
@@ -98,12 +100,63 @@ export const DEFAULT_SETTINGS: UserSettings = {
   mutations: [],
 };
 
-async function hashPassword(password: string): Promise<string> {
+// --- Crypto helpers ---
+const toHex = (bytes: Uint8Array) => Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+const fromHex = (hex: string) => new Uint8Array(hex.match(/.{2}/g)!.map(byte => parseInt(byte, 16)));
+
+const PBKDF2_ITERATIONS = 100_000;
+
+/** Modern PBKDF2 password hashing with random per-user salt. Returns `pbkdf2:iterations:saltHex:hashHex`. */
+async function hashPasswordPBKDF2(password: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const derivedBits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return `pbkdf2:${PBKDF2_ITERATIONS}:${toHex(salt)}:${toHex(new Uint8Array(derivedBits))}`;
+}
+
+/** Verify a password against a PBKDF2 hash string. */
+async function verifyPasswordPBKDF2(password: string, stored: string): Promise<boolean> {
+  const parts = stored.split(':');
+  if (parts.length !== 4 || parts[0] !== 'pbkdf2') return false;
+  const iterations = parseInt(parts[1], 10);
+  const salt = fromHex(parts[2]);
+  const expectedHash = parts[3];
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const derivedBits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return toHex(new Uint8Array(derivedBits)) === expectedHash;
+}
+
+/** Verify against the legacy SHA-256 + static salt scheme (for migration only). */
+async function verifyLegacyPassword(password: string, storedHash: string): Promise<boolean> {
   const encoder = new TextEncoder();
   const data = encoder.encode(password + '_projectz_salt');
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  const hashHex = toHex(new Uint8Array(hashBuffer));
+  return hashHex === storedHash;
+}
+
+// --- Rate limiting ---
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+const loginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+
+function recordFailedAttempt(key: string): void {
+  const current = loginAttempts.get(key) || { count: 0, lockedUntil: 0 };
+  current.count += 1;
+  if (current.count >= MAX_LOGIN_ATTEMPTS) {
+    current.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
+  }
+  loginAttempts.set(key, current);
 }
 
 let usersCache: Record<string, UserProfile> | null = null;
@@ -126,7 +179,7 @@ function saveAllUsers(users: Record<string, UserProfile>): void {
 
 export async function registerUser(username: string, password: string): Promise<{ success: boolean; error?: string }> {
   if (!username || username.length < 2) return { success: false, error: 'Имя пользователя должно быть не менее 2 символов' };
-  if (!password || password.length < 4) return { success: false, error: 'Пароль должен быть не менее 4 символов' };
+  if (!password || password.length < 8) return { success: false, error: 'Пароль должен быть не менее 8 символов' };
 
   const users = getAllUsers();
   const key = username.toLowerCase();
@@ -135,7 +188,7 @@ export async function registerUser(username: string, password: string): Promise<
     return { success: false, error: 'Пользователь с таким именем уже существует' };
   }
 
-  const passwordHash = await hashPassword(password);
+  const passwordHash = await hashPasswordPBKDF2(password);
   users[key] = {
     username,
     passwordHash,
@@ -149,20 +202,50 @@ export async function registerUser(username: string, password: string): Promise<
 }
 
 export async function loginUser(username: string, password: string): Promise<{ success: boolean; error?: string }> {
+  const AUTH_ERROR = 'Неверное имя пользователя или пароль';
+
   if (!username || !password) return { success: false, error: 'Введите имя пользователя и пароль' };
 
-  const users = getAllUsers();
   const key = username.toLowerCase();
+
+  // Rate limiting check
+  const attempts = loginAttempts.get(key);
+  if (attempts && attempts.lockedUntil > Date.now()) {
+    const remainingSec = Math.ceil((attempts.lockedUntil - Date.now()) / 1000);
+    return { success: false, error: `Слишком много попыток. Повторите через ${remainingSec} сек.` };
+  }
+
+  const users = getAllUsers();
   const user = users[key];
 
   if (!user) {
-    return { success: false, error: 'Пользователь не найден' };
+    recordFailedAttempt(key);
+    return { success: false, error: AUTH_ERROR };
   }
 
-  const passwordHash = await hashPassword(password);
-  if (user.passwordHash !== passwordHash) {
-    return { success: false, error: 'Неверный пароль' };
+  // Try PBKDF2 first, then fall back to legacy SHA-256 for migration
+  let passwordValid = false;
+  const isPBKDF2 = user.passwordHash.startsWith('pbkdf2:');
+
+  if (isPBKDF2) {
+    passwordValid = await verifyPasswordPBKDF2(password, user.passwordHash);
+  } else {
+    passwordValid = await verifyLegacyPassword(password, user.passwordHash);
   }
+
+  if (!passwordValid) {
+    recordFailedAttempt(key);
+    return { success: false, error: AUTH_ERROR };
+  }
+
+  // Migrate legacy hash to PBKDF2 on successful login
+  if (!isPBKDF2) {
+    user.passwordHash = await hashPasswordPBKDF2(password);
+    saveAllUsers(users);
+  }
+
+  // Clear failed attempts on success
+  loginAttempts.delete(key);
 
   localStorage.setItem(SESSION_KEY, key);
   return { success: true };
