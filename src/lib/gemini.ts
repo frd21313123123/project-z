@@ -30,7 +30,7 @@ export function buildCityImagePrompt(timelineText: string, location: string, ter
 
 export async function evaluateMutationProposal(
     proposal: string,
-    currentStats: { infected: number; zombies: number; elapsedDays: number },
+    currentStats: Record<string, number>,
     apiMeta: any
 ) {
     const res = await fetchWithAuth(`${API_BASE}/mutation`, {
@@ -70,18 +70,21 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
         for (const line of lines) {
             if (line.trim() === "data: [DONE]") break;
             if (line.startsWith("data: ")) {
+                let parsed: any;
                 try {
-                    const parsed = JSON.parse(line.slice(6));
-                    if (parsed.type === 'chunk') {
-                        yield parsed.text;
-                    } else if (parsed.type === 'mapUpdate') {
-                        params.onMapData?.(parsed.dayNum, parsed.dayDelta);
-                    } else if (parsed.type === 'notification') {
-                        params.onNotification?.(parsed.message, parsed.notifType);
-                    } else if (parsed.type === 'error') {
-                        throw new Error(parsed.error);
-                    }
-                } catch (e) {}
+                    parsed = JSON.parse(line.slice(6));
+                } catch (e) {
+                    continue;
+                }
+                if (parsed.type === 'chunk') {
+                    yield parsed.text;
+                } else if (parsed.type === 'mapUpdate') {
+                    params.onMapData?.(parsed.dayNum, parsed.dayDelta);
+                } else if (parsed.type === 'notification') {
+                    params.onNotification?.(parsed.message, parsed.notifType);
+                } else if (parsed.type === 'error') {
+                    throw new Error(parsed.error);
+                }
             }
         }
     }

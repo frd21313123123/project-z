@@ -1,9 +1,22 @@
 import { GoogleGenAI } from "@google/genai";
+import {
+    extractGeminiUsage,
+    extractOpenAiUsage,
+    noopAiBilling,
+    type AiBilling,
+    type AiProvider,
+} from "./aiBilling";
 
 const getGenAI = (apiKey: string) => {
     if (!apiKey) throw new Error("Gemini API Key is required. Please enter it in the settings.");
     return new GoogleGenAI({ apiKey });
 };
+
+const getBilling = (billing?: AiBilling) => billing || noopAiBilling;
+const getExternalProvider = (providerName = ""): AiProvider => (
+    providerName.toLowerCase() === "openrouter" ? "openrouter" : "openai"
+);
+const appReferer = () => process.env.APP_URL || "http://localhost:3000";
 
 // --- Prompt Injection Protection ---
 const INJECTION_PATTERNS = [
@@ -38,10 +51,58 @@ const EMPTY_MAP_DATA = {
     movements: [],
     pois: [],
     perimeters: [],
-    stats: {
-        infected: 0,
-        zombies: 0
+    stats: {}
+};
+
+const DEFAULT_COUNTER_DEFINITIONS = [
+    {
+        key: "infected",
+        label: "Заражены",
+        description: "Living humans currently infected but not yet transformed."
+    },
+    {
+        key: "zombies",
+        label: "Зомби",
+        description: "Active transformed zombies."
     }
+];
+
+const sanitizeCounterKey = (value: string, index: number) => {
+    return String(value || `counter_${index + 1}`)
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_|_$/g, "") || `counter_${index + 1}`;
+};
+
+const getCounterDefinitions = (params: any) => {
+    const source = Array.isArray(params?.scenarioCounters) && params.scenarioCounters.length > 0
+        ? params.scenarioCounters
+        : DEFAULT_COUNTER_DEFINITIONS;
+
+    return source.slice(0, 6).map((counter: any, index: number) => ({
+        key: sanitizeCounterKey(counter?.key, index),
+        label: String(counter?.label || counter?.key || `Counter ${index + 1}`),
+        description: String(counter?.description || "")
+    }));
+};
+
+const getCounterValue = (mapData: any, key: string) => {
+    const legacyValue = key === "infected"
+        ? mapData?.totalInfected
+        : key === "zombies"
+            ? mapData?.totalZombies
+            : undefined;
+    const value = Number(mapData?.stats?.[key] ?? mapData?.counts?.[key] ?? legacyValue ?? 0);
+    return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+};
+
+const normalizeStats = (mapData: any, counters = DEFAULT_COUNTER_DEFINITIONS) => {
+    const stats: Record<string, number> = {};
+    for (const counter of counters) {
+        stats[counter.key] = getCounterValue(mapData, counter.key);
+    }
+    return stats;
 };
 
 const stripMapDataBlocks = (text: string = "") => {
@@ -68,18 +129,15 @@ const parseJsonObject = (text: string) => {
     }
 };
 
-const normalizeMapData = (mapData: any) => ({
+const normalizeMapData = (mapData: any, counters = DEFAULT_COUNTER_DEFINITIONS) => ({
     infected: Array.isArray(mapData?.infected) ? mapData.infected : [],
     movements: Array.isArray(mapData?.movements) ? mapData.movements : [],
     pois: Array.isArray(mapData?.pois) ? mapData.pois : [],
     perimeters: Array.isArray(mapData?.perimeters) ? mapData.perimeters : [],
-    stats: {
-        infected: Math.max(0, Math.round(Number(mapData?.stats?.infected ?? mapData?.counts?.infected ?? mapData?.totalInfected ?? 0))),
-        zombies: Math.max(0, Math.round(Number(mapData?.stats?.zombies ?? mapData?.counts?.zombies ?? mapData?.totalZombies ?? 0)))
-    }
+    stats: normalizeStats(mapData, counters)
 });
 
-const mergeMapData = (base: any, delta: any) => {
+const mergeMapData = (base: any, delta: any, counters = DEFAULT_COUNTER_DEFINITIONS) => {
     const merge = (b: any[], d: any[]) => {
         const result = [...b];
         d.forEach(newItem => {
@@ -96,8 +154,8 @@ const mergeMapData = (base: any, delta: any) => {
         });
         return result;
     };
-    const b = normalizeMapData(base);
-    const d = normalizeMapData(delta);
+    const b = normalizeMapData(base, counters);
+    const d = normalizeMapData(delta, counters);
     return {
         infected: merge(b.infected, d.infected),
         movements: d.movements, // Transient: movements only represent the CURRENT step
@@ -125,12 +183,23 @@ async function generateMapState(
         dayAgentConversationLog: string;
     }
 ) {
-    const mapPrompt = `You are the authoritative outbreak state master for a zombie outbreak simulation.
+    const counterDefinitions = getCounterDefinitions(params);
+    const counterPrompt = counterDefinitions
+        .map(counter => `- stats.${counter.key} (${sanitizePromptInput(counter.label, 120)}): ${sanitizePromptInput(counter.description, 500) || "scenario-defined tracked population/state."}`)
+        .join("\n");
+    const statsSchema = counterDefinitions
+        .map(counter => `"${counter.key}": number`)
+        .join(", ");
+    const transformedCounter = counterDefinitions[1] || counterDefinitions[0];
+    const mapPrompt = `You are the authoritative outbreak state master for a configurable outbreak simulation.
 Daily agents only write narrative day logs. They are forbidden to create map data.
 You, the master, are solely responsible for generating all map data, visible map objects, movements, perimeters, POIs, and outbreak counters.
 
 Current map state JSON (use ONLY for context and stable IDs):
-${safeStringify(normalizeMapData(currentMapData))}
+${safeStringify(normalizeMapData(currentMapData, counterDefinitions))}
+
+Scenario outbreak counters to track:
+${counterPrompt}
 
 Master strategic plan:
 ${masterContext?.masterPlan || 'No master plan available.'}
@@ -168,14 +237,12 @@ CRITICAL RULES:
 3. ONLY THE DELTA: If an object existed yesterday and nothing changed today, EXCLUDE IT completely.
 4. STABLE IDs: If an existing object (e.g., a military unit or a specific infection cluster) does something new today, use its "id" from the current state to represent the update.
 5. DELETION: To remove an existing object (e.g., a military base was destroyed or an infection cluster was cleared), include its "id" and set "deleted": true (or "intensity": 0 for infected zones).
-6. STATS ARE TOTALS, NOT DELTAS: stats.infected and stats.zombies must be the current total numbers after all events through Day ${targetDay || 'X'}, including previous days from Current map state JSON.
+6. STATS ARE TOTALS, NOT DELTAS: every key in stats must be the current total number after all events through Day ${targetDay || 'X'}, including previous days from Current map state JSON.
 7. COUNTING DEFINITIONS:
-   - stats.infected = living humans currently infected but not yet turned.
-   - stats.zombies = active turned zombies.
-   - Do not count dead humans as infected or zombies.
-   - If a person turns, subtract them from infected and add them to zombies.
-   - If a zombie is destroyed, subtract it from zombies.
-   - If an infected human dies before turning, subtract them from infected.
+${counterPrompt}
+   - Do not count dead humans inside living-state counters unless the scenario defines a dedicated dead/deceased counter.
+   - If a person moves from one tracked state to another, subtract them from the old counter and add them to the new counter.
+   - If a ${transformedCounter?.label || "transformed entity"} is destroyed, killed, cured, or otherwise removed from active play, subtract it from stats.${transformedCounter?.key || "infected"} unless another scenario counter should receive it.
 8. MASTER CONTEXT: Use the full day-agent conversation log and full simulation timeline to resolve contradictions, preserve continuity, and avoid losing details from earlier generated content.
 9. DAY AGENT BOUNDARY: Never assume the day agent has generated map data. It only generated narrative evidence. You must translate that evidence into map data yourself.
 
@@ -185,11 +252,11 @@ Return one complete JSON object with this schema:
   "movements": [{"id": "stable_id", "from": [lat, lng], "to": [lat, lng], "type": "car|ship|plane|foot", "label": string}],
   "pois": [{"id": "stable_id", "lat": number, "lng": number, "type": "military_base|military_clinic|clinic|other", "label": string, "deleted": boolean}],
   "perimeters": [{"id": "stable_id", "points": [[lat, lng], [lat, lng], [lat, lng], [lat, lng]], "type": "military_defense|quarantine|other", "label": string, "deleted": boolean}],
-  "stats": {"infected": number, "zombies": number}
+  "stats": {${statsSchema}}
 }
 
 Rules:
-- Always include stats with non-negative integer values.
+- Always include all configured stats keys with non-negative integer values.
 - Coordinates must stay near ${params.location} unless the text clearly expands the outbreak.
 - Return JSON only, no markdown, no comments.`;
 
@@ -197,36 +264,57 @@ Rules:
 
     if (apiMeta.isExternalAPI) {
         if (!apiMeta.apiKey) throw new Error(`${apiMeta.providerName} API Key is required. Please enter it in the settings.`);
-        const res = await fetch(apiMeta.apiUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiMeta.apiKey}`,
-                "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
-                "X-Title": "Project Z"
-            },
-            body: JSON.stringify({
-                model: params.textModel,
-                messages: [{ role: "user", content: mapPrompt }],
-                temperature: 0.2
-            })
+        const data = await getBilling(apiMeta.billing).run({
+            provider: getExternalProvider(apiMeta.providerName),
+            kind: "text",
+            model: params.textModel,
+            inputText: mapPrompt,
+            estimatedOutputTokens: 1600,
+        }, async () => {
+            const res = await fetch(apiMeta.apiUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiMeta.apiKey}`,
+                    "HTTP-Referer": appReferer(),
+                    "X-Title": "Project Z"
+                },
+                body: JSON.stringify({
+                    model: params.textModel,
+                    messages: [{ role: "user", content: mapPrompt }],
+                    temperature: 0.2
+                })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
+            const outputText = data.choices?.[0]?.message?.content || "";
+            return { result: data, ...extractOpenAiUsage(data), outputText };
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
         raw = data.choices?.[0]?.message?.content || "";
     } else {
         const ai = getGenAI(apiMeta.geminiKey || params.geminiKey);
-        const response = await ai.models.generateContent({
-            model: params.textModel || "gemini-3.1-pro-preview",
-            contents: mapPrompt,
-            config: {
-                temperature: 0.2,
-            }
+        const model = params.textModel || "gemini-3.1-pro-preview";
+        const response = await getBilling(apiMeta.billing).run({
+            provider: "gemini",
+            kind: "text",
+            model,
+            inputText: mapPrompt,
+            estimatedOutputTokens: 1600,
+        }, async () => {
+            const response = await ai.models.generateContent({
+                model,
+                contents: mapPrompt,
+                config: {
+                    temperature: 0.2,
+                }
+            });
+            const outputText = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            return { result: response, ...extractGeminiUsage(response), outputText };
         });
         raw = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
     }
 
-    return normalizeMapData(parseJsonObject(raw) ?? currentMapData);
+    return normalizeMapData(parseJsonObject(raw) ?? currentMapData, counterDefinitions);
 }
 
 /**
@@ -265,17 +353,22 @@ const extractDayNumbers = (text: string): number[] => {
 
 export async function evaluateMutationProposal(
     proposal: string,
-    currentStats: { infected: number; zombies: number; elapsedDays: number },
+    currentStats: Record<string, number>,
     apiMeta: { isExternalAPI: boolean; apiUrl: string; apiKey: string; providerName: string; textModel: string; geminiKey?: string }
 ): Promise<{ approved: boolean; cost: number; reason: string; name: string }> {
+    const elapsedDays = Number(currentStats.elapsedDays || 0);
+    const countersText = Object.entries(currentStats)
+        .filter(([key]) => key !== "elapsedDays")
+        .map(([key, value]) => `- ${key}: ${Math.max(0, Math.round(Number(value) || 0))}`)
+        .join("\n") || "- No configured counters yet";
     const prompt = `You are the strict Game Master of a virus outbreak simulation.
 A player wants to evolve the virus with a custom mutation.
 Your task is to evaluate the proposal for balance, feasibility, and flavor.
 
 Current Game State:
-- Day: ${currentStats.elapsedDays}
-- Total Infected (Living): ${currentStats.infected}
-- Total Zombies: ${currentStats.zombies}
+- Day: ${elapsedDays}
+Configured outbreak counters:
+${countersText}
 
 Player Proposal: "${sanitizePromptInput(proposal)}"
 
@@ -299,29 +392,51 @@ Return ONLY a JSON object:
 
     let raw = "";
     if (apiMeta.isExternalAPI) {
-        const res = await fetch(apiMeta.apiUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiMeta.apiKey}`,
-                "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
-                "X-Title": "Project Z"
-            },
-            body: JSON.stringify({
-                model: apiMeta.textModel,
-                messages: [{ role: "user", content: prompt }],
-                temperature: 0.3
-            })
+        if (!apiMeta.apiKey) throw new Error(`${apiMeta.providerName} API Key is required. Please enter it in the settings.`);
+        const data = await getBilling((apiMeta as any).billing).run({
+            provider: getExternalProvider(apiMeta.providerName),
+            kind: "text",
+            model: apiMeta.textModel,
+            inputText: prompt,
+            estimatedOutputTokens: 600,
+        }, async () => {
+            const res = await fetch(apiMeta.apiUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiMeta.apiKey}`,
+                    "HTTP-Referer": appReferer(),
+                    "X-Title": "Project Z"
+                },
+                body: JSON.stringify({
+                    model: apiMeta.textModel,
+                    messages: [{ role: "user", content: prompt }],
+                    temperature: 0.3
+                })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
+            const outputText = data.choices?.[0]?.message?.content || "";
+            return { result: data, ...extractOpenAiUsage(data), outputText };
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error?.message || `${apiMeta.providerName} API Error`);
         raw = data.choices?.[0]?.message?.content || "";
     } else {
         const ai = getGenAI(apiMeta.geminiKey);
-        const response = await ai.models.generateContent({
-            model: apiMeta.textModel || "gemini-3.1-pro-preview",
-            contents: prompt,
-            config: { temperature: 0.3 }
+        const model = apiMeta.textModel || "gemini-3.1-pro-preview";
+        const response = await getBilling((apiMeta as any).billing).run({
+            provider: "gemini",
+            kind: "text",
+            model,
+            inputText: prompt,
+            estimatedOutputTokens: 600,
+        }, async () => {
+            const response = await ai.models.generateContent({
+                model,
+                contents: prompt,
+                config: { temperature: 0.3 }
+            });
+            const outputText = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            return { result: response, ...extractGeminiUsage(response), outputText };
         });
         raw = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
     }
@@ -338,7 +453,7 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
     const apiUrl = params.textProvider === 'openrouter' ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
     const apiKey = params.textProvider === 'openrouter' ? params.openRouterKey : params.openAiKey;
     const providerName = params.textProvider === 'openrouter' ? "OpenRouter" : "OpenAI";
-    const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName, geminiKey: params.geminiKey };
+    const apiMeta = { isExternalAPI, apiUrl, apiKey, providerName, geminiKey: params.geminiKey, billing: params.billing };
     const onNotification = params.onNotification;
     let daysToSimulate = 1;
     let daysPerGeneration = 1;
@@ -363,6 +478,10 @@ export async function* simulateOutbreakStepStream(params: any): AsyncGenerator<s
     const mutationDescription = params.activeMutations?.length > 0 
         ? `\nАКТИВНЫЕ МУТАЦИИ ВИРУСА:\n${params.activeMutations.map((m: any) => `- ${sanitizePromptInput(m.name, 100)}: ${sanitizePromptInput(m.description, 500)} (Применена на день ${Number(m.dayApplied) || 0})`).join('\n')}`
         : '';
+    const counterDefinitions = getCounterDefinitions(params);
+    const counterDescription = counterDefinitions
+        .map(counter => `- ${counter.label} (stats.${counter.key}): ${sanitizePromptInput(counter.description, 500) || 'сценарный счетчик'}`)
+        .join('\n');
 
     const masterPrompt = `Ты - Мастер Симуляции Вируса (Уровень Стратегии).
 Твоя задача — составить стратегический план (промпт) для другой нейросети-логгера на следующий период: ${params.stepAmount}.
@@ -372,6 +491,9 @@ ${sanitizePromptInput(params.scenario)}
 
 Фазы симптомов вируса:
 ${sanitizePromptInput(params.symptomDescription || 'Не указаны')}
+
+Счетчики состояния, которые обязан вести мастер карты:
+${counterDescription}
 ${mutationDescription}
 
 Стартовая позиция: ${params.location}
@@ -391,28 +513,49 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
 
     if (isExternalAPI) {
         if (!apiKey) throw new Error(`${providerName} API Key is required. Please enter it in the settings.`);
-        const res = await fetch(apiUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`,
-                "HTTP-Referer": window.location.href, // Required for OpenRouter
-                "X-Title": "Project Z"
-            },
-            body: JSON.stringify({
-                model: params.textModel,
-                messages: [{ role: "user", content: masterPrompt }],
-                temperature: 0.7
-            })
+        const data = await getBilling(params.billing).run({
+            provider: getExternalProvider(providerName),
+            kind: "text",
+            model: params.textModel,
+            inputText: masterPrompt,
+            estimatedOutputTokens: 1800,
+        }, async () => {
+            const res = await fetch(apiUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`,
+                    "HTTP-Referer": appReferer(),
+                    "X-Title": "Project Z"
+                },
+                body: JSON.stringify({
+                    model: params.textModel,
+                    messages: [{ role: "user", content: masterPrompt }],
+                    temperature: 0.7
+                })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error?.message || `${providerName} API Error`);
+            const outputText = data.choices?.[0]?.message?.content || "";
+            return { result: data, ...extractOpenAiUsage(data), outputText };
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error?.message || `${providerName} API Error`);
         masterPlan = data.choices[0].message.content;
     } else {
         const ai = getGenAI(params.geminiKey);
-        const masterResponse = await ai.models.generateContent({
-            model: params.textModel || "gemini-3.1-pro-preview",
-            contents: masterPrompt,
+        const model = params.textModel || "gemini-3.1-pro-preview";
+        const masterResponse = await getBilling(params.billing).run({
+            provider: "gemini",
+            kind: "text",
+            model,
+            inputText: masterPrompt,
+            estimatedOutputTokens: 1800,
+        }, async () => {
+            const masterResponse = await ai.models.generateContent({
+                model,
+                contents: masterPrompt,
+            });
+            const outputText = masterResponse.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            return { result: masterResponse, ...extractGeminiUsage(masterResponse), outputText };
         });
         masterPlan = masterResponse.candidates?.[0]?.content?.parts?.[0]?.text || "План не сгенерирован.";
     }
@@ -422,7 +565,7 @@ ${stripMapDataBlocks(params.previousTimeline || "")}
     let fullTimelineContext = stripMapDataBlocks(params.previousTimeline || "");
     let fullSimulationTimelineForMaster = fullTimelineContext;
     let dayAgentConversationLog = "";
-    let currentMapData = normalizeMapData(params.mapData);
+    let currentMapData = normalizeMapData(params.mapData, counterDefinitions);
 
     for (let i = 0; i < totalGenerations; i++) {
         const startDayIndex = params.elapsedDays + 1 + (i * daysPerGeneration);
@@ -448,6 +591,9 @@ ${fullTimelineContext || 'Ранее событий нет.'}
 Твоя задача: расписать ${daysInstruction}. 
 Текущая дата для Дня ${startDayIndex}: ${params.currentDate}.
 
+Счетчики состояния для этого сценария:
+${counterDescription}
+
 КРИТИЧЕСКИЕ ПРАВИЛА ФОРМАТА:
 1. Для КАЖДОГО дня твоего периода вывод ДОЛЖЕН СТРОГО начинаться С НОВОЙ СТРОКИ (лучше с двойного переноса строки) со строки: DAY_{НОМЕР_ДНЯ} (Дата):
    Пример: 
@@ -468,66 +614,100 @@ ${fullTimelineContext || 'Ранее событий нет.'}
         let generatedDayText = "";
 
         if (isExternalAPI) {
-            const res = await fetch(apiUrl, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${apiKey}`,
-                    "HTTP-Referer": window.location.href,
-                    "X-Title": "Project Z"
-                },
-                body: JSON.stringify({
-                    model: params.textModel,
-                    messages: [{ role: "user", content: dayPrompt }],
-                    temperature: 0.7,
-                    stream: true
-                })
+            const reservation = await getBilling(params.billing).reserve({
+                provider: getExternalProvider(providerName),
+                kind: "text",
+                model: params.textModel,
+                inputText: dayPrompt,
+                estimatedOutputTokens: daysPerGeneration > 1 ? 6000 : 2500,
             });
-            
-            if (!res.ok) {
-                const data = await res.json();
-                throw new Error(data.error?.message || `${providerName} API Error`);
-            }
-            
-            const reader = res.body?.getReader();
-            const decoder = new TextDecoder("utf-8");
-            let buffer = "";
-            
-            while (reader) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                let lines = buffer.split("\n");
-                buffer = lines.pop() || "";
-                for (const line of lines) {
-                    if (line.trim() === "data: [DONE]") break;
-                    if (line.startsWith("data: ")) {
-                        try {
-                            const parsed = JSON.parse(line.slice(6));
-                            const chunk = parsed.choices[0]?.delta?.content;
-                            if (chunk) {
-                                generatedDayText += chunk;
-                                yield chunk;
-                            }
-                        } catch (e) {}
+
+            let usage: any;
+            try {
+                const res = await fetch(apiUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${apiKey}`,
+                        "HTTP-Referer": appReferer(),
+                        "X-Title": "Project Z"
+                    },
+                    body: JSON.stringify({
+                        model: params.textModel,
+                        messages: [{ role: "user", content: dayPrompt }],
+                        temperature: 0.7,
+                        stream: true,
+                        stream_options: { include_usage: true }
+                    })
+                });
+
+                if (!res.ok) {
+                    const data = await res.json();
+                    throw new Error(data.error?.message || `${providerName} API Error`);
+                }
+
+                const reader = res.body?.getReader();
+                const decoder = new TextDecoder("utf-8");
+                let buffer = "";
+
+                while (reader) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    let lines = buffer.split("\n");
+                    buffer = lines.pop() || "";
+                    for (const line of lines) {
+                        if (line.trim() === "data: [DONE]") break;
+                        if (line.startsWith("data: ")) {
+                            try {
+                                const parsed = JSON.parse(line.slice(6));
+                                if (parsed.usage) usage = { usage: parsed.usage };
+                                const chunk = parsed.choices?.[0]?.delta?.content;
+                                if (chunk) {
+                                    generatedDayText += chunk;
+                                    yield chunk;
+                                }
+                            } catch (e) {}
+                        }
                     }
                 }
+                await reservation.settle({ ...extractOpenAiUsage(usage), outputText: generatedDayText });
+            } catch (err) {
+                await reservation.refund();
+                throw err;
             }
         } else {
             const ai = getGenAI(params.geminiKey);
-            const stream = await ai.models.generateContentStream({
-                model: params.textModel || "gemini-3.1-pro-preview",
-                contents: dayPrompt,
-                config: {
-                    temperature: 0.7,
-                }
+            const model = params.textModel || "gemini-3.1-pro-preview";
+            const reservation = await getBilling(params.billing).reserve({
+                provider: "gemini",
+                kind: "text",
+                model,
+                inputText: dayPrompt,
+                estimatedOutputTokens: daysPerGeneration > 1 ? 6000 : 2500,
             });
 
-            for await (const chunk of stream) {
-                if (chunk.text) {
-                    generatedDayText += chunk.text;
-                    yield chunk.text;
+            let usage: any;
+            try {
+                const stream = await ai.models.generateContentStream({
+                    model,
+                    contents: dayPrompt,
+                    config: {
+                        temperature: 0.7,
+                    }
+                });
+
+                for await (const chunk of stream) {
+                    usage = (chunk as any).usageMetadata ? chunk : usage;
+                    if (chunk.text) {
+                        generatedDayText += chunk.text;
+                        yield chunk.text;
+                    }
                 }
+                await reservation.settle({ ...extractGeminiUsage(usage), outputText: generatedDayText });
+            } catch (err) {
+                await reservation.refund();
+                throw err;
             }
         }
 
@@ -565,7 +745,7 @@ ${fullTimelineContext || 'Ранее событий нет.'}
                             dayAgentConversationLog
                         });
                         params.onMapData?.(dayNum, dayDelta);
-                        currentMapData = mergeMapData(currentMapData, dayDelta);
+                        currentMapData = mergeMapData(currentMapData, dayDelta, counterDefinitions);
                     }
                 }
             } else {
@@ -578,7 +758,7 @@ ${fullTimelineContext || 'Ранее событий нет.'}
                     dayAgentConversationLog
                 });
                 params.onMapData?.(endDayIndex, dayDelta);
-                currentMapData = mergeMapData(currentMapData, dayDelta);
+                currentMapData = mergeMapData(currentMapData, dayDelta, counterDefinitions);
             }
         } catch (e: any) {
             console.warn("Map state generation failed", e);
@@ -600,54 +780,83 @@ ${timelineText.slice(-1000)}
 Покажи вид города, разрушения или состояние людей. Без текста на изображении. Кинематографичный стиль, мрачный, напряженный, детализированный.`;
 }
 
-export async function generateCityImage(timelineText: string, location: string, imageModel: string = 'imagen-3.0-generate-002', openAiKey?: string, terrainContext?: string, geminiKey?: string): Promise<string> {
+export async function generateCityImage(timelineText: string, location: string, imageModel: string = 'imagen-3.0-generate-002', openAiKey?: string, terrainContext?: string, geminiKey?: string, billing?: AiBilling): Promise<string> {
     const prompt = buildCityImagePrompt(timelineText, location, terrainContext);
 
     const generateImage = async (model: string) => {
         if (model === 'dall-e-3') {
             if (!openAiKey) throw new Error("OpenAI API Key is required for DALL-E 3. Please enter it in the settings.");
-            const res = await fetch("https://api.openai.com/v1/images/generations", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${openAiKey}`
-                },
-                body: JSON.stringify({
-                    model: "dall-e-3",
-                    prompt: prompt,
-                    n: 1,
-                    size: "1024x1024",
-                    response_format: "b64_json"
-                })
+            return await getBilling(billing).run({
+                provider: "openai",
+                kind: "image",
+                model: "dall-e-3",
+                inputText: prompt,
+                imageCount: 1,
+                imageSize: "1024x1024",
+            }, async () => {
+                const res = await fetch("https://api.openai.com/v1/images/generations", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${openAiKey}`
+                    },
+                    body: JSON.stringify({
+                        model: "dall-e-3",
+                        prompt: prompt,
+                        n: 1,
+                        size: "1024x1024",
+                        response_format: "b64_json"
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error?.message || "OpenAI API Error");
+                return { result: `data:image/jpeg;base64,${data.data[0].b64_json}`, imageCount: 1 };
             });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error?.message || "OpenAI API Error");
-            return `data:image/jpeg;base64,${data.data[0].b64_json}`;
         }
 
         const ai = getGenAI(geminiKey || '');
         if (model.startsWith('imagen')) {
-            const response = await ai.models.generateImages({
-                model: model,
-                prompt: prompt,
-                config: {
-                    numberOfImages: 1,
-                    outputMimeType: 'image/jpeg',
-                    aspectRatio: '16:9',
-                },
+            const response = await getBilling(billing).run({
+                provider: "gemini",
+                kind: "image",
+                model,
+                inputText: prompt,
+                imageCount: 1,
+                imageSize: "16:9",
+            }, async () => {
+                const response = await ai.models.generateImages({
+                    model: model,
+                    prompt: prompt,
+                    config: {
+                        numberOfImages: 1,
+                        outputMimeType: 'image/jpeg',
+                        aspectRatio: '16:9',
+                    },
+                });
+                return { result: response, imageCount: response.generatedImages?.length || 1 };
             });
             const base64EncodeString = response.generatedImages[0].image.imageBytes;
             return `data:image/jpeg;base64,${base64EncodeString}`;
         } else {
-            const response = await ai.models.generateContent({
-                model: model,
-                contents: prompt,
-                config: {
-                    imageConfig: {
-                        aspectRatio: "16:9",
-                        imageSize: "1K"
+            const response = await getBilling(billing).run({
+                provider: "gemini",
+                kind: "image",
+                model,
+                inputText: prompt,
+                imageCount: 1,
+                imageSize: "1K",
+            }, async () => {
+                const response = await ai.models.generateContent({
+                    model: model,
+                    contents: prompt,
+                    config: {
+                        imageConfig: {
+                            aspectRatio: "16:9",
+                            imageSize: "1K"
+                        }
                     }
-                }
+                });
+                return { result: response, ...extractGeminiUsage(response), imageCount: 1 };
             });
 
             for (const part of response.candidates?.[0]?.content?.parts || []) {

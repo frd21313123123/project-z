@@ -1,9 +1,12 @@
 import { useState, useRef, useEffect, useMemo, useCallback, lazy, Suspense } from 'react';
 import { AuthScreen } from './components/AuthScreen';
+import { BalanceScreen } from './components/BalanceScreen';
+import { AdminScreen } from './components/AdminScreen';
 import { simulateOutbreakStepStream, generateCityImage, buildCityImagePrompt, evaluateMutationProposal } from './lib/gemini';
 import { buildTerrainContext } from './lib/geoContext';
-import { getSessionUsername, getSessionToken, fetchCurrentUser, getUserSettings, saveUserSettings, logoutUser, saveGame, loadGame, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS, type GameSave, type Mutation } from './lib/auth';
-import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, UserRound, Skull, Microscope, Dna, Save, Upload, Download } from 'lucide-react';
+import { getSessionUsername, getSessionToken, fetchCurrentUser, getUserSettings, saveUserSettings, logoutUser, saveGame, loadGame, type UserSettings, type SymptomPhase, DEFAULT_SYMPTOM_PHASES, type Scenario, DEFAULT_SCENARIOS, DEFAULT_SCENARIO_COUNTERS, normalizeScenarios, normalizeSelectedScenarioId, type GameSave, type Mutation } from './lib/auth';
+import { fetchBillingSummary, type BillingSummary } from './lib/billing';
+import { Biohazard, ChevronLeft, ChevronRight, Image as ImageIcon, Loader2, Settings, X, LogOut, Eye, EyeOff, Pencil, Plus, Trash2, Check, RotateCcw, UserRound, Skull, Microscope, Dna, Save, Upload, Download, Wallet, AlertTriangle } from 'lucide-react';
 
 // Lazy load heavy components
 const MapView = lazy(() => import('./components/MapView').then(module => ({ default: module.MapView })));
@@ -25,7 +28,7 @@ interface Notification {
   type: 'info' | 'error' | 'warning';
 }
 
-const emptyMapData = () => ({ infected: [], movements: [], pois: [], perimeters: [], stats: { infected: 0, zombies: 0 } });
+const emptyMapData = () => ({ infected: [], movements: [], pois: [], perimeters: [], stats: {} });
 
 const normalizeMapData = (mapData: any) => ({
   infected: Array.isArray(mapData?.infected) ? mapData.infected : [],
@@ -38,14 +41,13 @@ const normalizeMapData = (mapData: any) => ({
   totalZombies: mapData?.totalZombies
 });
 
-const getInfectionCount = (mapData: any) => {
-  const explicitCount = Number(mapData?.stats?.infected ?? mapData?.counts?.infected ?? mapData?.totalInfected);
-  if (Number.isFinite(explicitCount)) return Math.max(0, Math.round(explicitCount));
-  return 0;
-};
-
-const getZombieCount = (mapData: any) => {
-  const explicitCount = Number(mapData?.stats?.zombies ?? mapData?.counts?.zombies ?? mapData?.totalZombies);
+const getCounterValue = (mapData: any, key: string) => {
+  const legacyValue = key === 'infected'
+    ? mapData?.totalInfected
+    : key === 'zombies'
+      ? mapData?.totalZombies
+      : undefined;
+  const explicitCount = Number(mapData?.stats?.[key] ?? mapData?.counts?.[key] ?? legacyValue);
   if (Number.isFinite(explicitCount)) return Math.max(0, Math.round(explicitCount));
   return 0;
 };
@@ -82,6 +84,7 @@ export default function App() {
   const [isInitializing, setIsInitializing] = useState(true);
   const [isAuthed, setIsAuthed] = useState(false);
   const [currentUsername, setCurrentUsername] = useState('');
+  const [billingSummary, setBillingSummary] = useState<BillingSummary | null>(null);
 
   useEffect(() => {
     async function init() {
@@ -90,6 +93,7 @@ export default function App() {
         if (user) {
           setIsAuthed(true);
           setCurrentUsername(user.username);
+          if (user.billing) setBillingSummary(user.billing as BillingSummary);
         } else {
           setIsAuthed(false);
         }
@@ -113,20 +117,17 @@ export default function App() {
       setOpenRouterKey(settings.openRouterKey);
       setShowMapOverlay(settings.showMapOverlay);
       setSymptomPhases(settings.symptomPhases || DEFAULT_SYMPTOM_PHASES);
-      setScenarios(settings.scenarios || DEFAULT_SCENARIOS);
-      setSelectedScenarioId(settings.selectedScenarioId || 'default_zombie');
+      setScenarios(normalizeScenarios(settings.scenarios));
+      setSelectedScenarioId(normalizeSelectedScenarioId(settings.selectedScenarioId));
       setMutationPoints(settings.mutationPoints ?? 80);
       setActiveMutations(settings.mutations || []);
       if (settings.textScale) setTextScale(settings.textScale);
     }
   }, [isInitializing, isAuthed]);
 
-  if (isInitializing) {
-    return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">Loading...</div>;
-  }
-
-
   const [isMainMenu, setIsMainMenu] = useState(true);
+  const [isBalanceScreenOpen, setIsBalanceScreenOpen] = useState(false);
+  const [isAdminScreenOpen, setIsAdminScreenOpen] = useState(false);
   const [isRoleSelectOpen, setIsRoleSelectOpen] = useState(false);
   const [isScenarioSelectOpen, setIsScenarioSelectOpen] = useState(false);
   const [isDiseaseWindowOpen, setIsDiseaseWindowOpen] = useState(false);
@@ -135,6 +136,7 @@ export default function App() {
   const handleAuthSuccess = useCallback(() => {
     setIsAuthed(true);
     setCurrentUsername(getSessionUsername() || '');
+    fetchBillingSummary().then(setBillingSummary).catch(() => {});
     // Load saved settings
     const saved = getUserSettings();
     setTextProvider(saved.textProvider);
@@ -146,8 +148,8 @@ export default function App() {
     setOpenRouterKey(saved.openRouterKey);
     setShowMapOverlay(saved.showMapOverlay);
     setSymptomPhases(saved.symptomPhases || DEFAULT_SYMPTOM_PHASES);
-    setScenarios(saved.scenarios || DEFAULT_SCENARIOS);
-    setSelectedScenarioId(saved.selectedScenarioId || 'default_zombie');
+    setScenarios(normalizeScenarios(saved.scenarios));
+    setSelectedScenarioId(normalizeSelectedScenarioId(saved.selectedScenarioId));
     setMutationPoints(saved.mutationPoints ?? 80);
     setActiveMutations(saved.mutations || []);
     }, []);
@@ -156,18 +158,24 @@ export default function App() {
     logoutUser();
     setIsAuthed(false);
     setCurrentUsername('');
+    setBillingSummary(null);
     setIsMainMenu(true);
+    setIsBalanceScreenOpen(false);
+    setIsAdminScreenOpen(false);
     setIsRoleSelectOpen(false);
     setIsScenarioSelectOpen(false);
   }, []);
 
   const [location, setLocation] = useState<[number, number]>([55.7558, 37.6173]);
   const [startDate, setStartDate] = useState(new Date().toISOString().split('T')[0]);
-  const [scenarios, setScenarios] = useState<Scenario[]>(DEFAULT_SCENARIOS);
+  const [scenarios, setScenarios] = useState<Scenario[]>(normalizeScenarios(DEFAULT_SCENARIOS));
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>('default_zombie');
   const activeScenario = useMemo(() => scenarios.find(s => s.id === selectedScenarioId) || scenarios[0], [scenarios, selectedScenarioId]);
+  const activeScenarioCounters = useMemo(() => (
+    activeScenario?.counters?.length ? activeScenario.counters : DEFAULT_SCENARIO_COUNTERS
+  ), [activeScenario]);
 
-  const updateScenario = useCallback((id: string, field: keyof Scenario, value: string) => {
+  const updateScenario = useCallback((id: string, field: keyof Scenario, value: Scenario[keyof Scenario]) => {
     setScenarios(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s));
   }, []);
 
@@ -239,7 +247,8 @@ export default function App() {
       name: 'Новый сценарий',
       preface: '',
       origin: '',
-      symptoms: ''
+      symptoms: '',
+      counters: DEFAULT_SCENARIO_COUNTERS.map(counter => ({ ...counter }))
     };
     setScenarios(prev => [...prev, newScenario]);
     handleSelectScenario(newId);
@@ -267,6 +276,12 @@ export default function App() {
     }, 5000);
   }, []);
 
+  const refreshBillingSummary = useCallback(async () => {
+    try {
+      setBillingSummary(await fetchBillingSummary());
+    } catch (e) {}
+  }, []);
+
   const compileSaveData = useCallback((): GameSave => {
     return {
       timeline,
@@ -292,8 +307,8 @@ export default function App() {
     setSymptomPhases(save.symptomPhases || DEFAULT_SYMPTOM_PHASES);
     setStartDate(save.startDate || '1989-07-03');
     setLocation(save.location || [39.8283, -98.5795]);
-    setSelectedScenarioId(save.selectedScenarioId || 'default_zombie');
-    if (save.scenarios) setScenarios(save.scenarios);
+    setSelectedScenarioId(normalizeSelectedScenarioId(save.selectedScenarioId));
+    if (save.scenarios) setScenarios(normalizeScenarios(save.scenarios));
     setImages(save.images || {});
     setImagePrompts(save.imagePrompts || {});
     setSelectedDayIndex(-1);
@@ -504,6 +519,7 @@ export default function App() {
         terrainContext,
         startDate,
         scenario: `[Предисловие]: ${activeScenario.preface}\n[Начало/Причина]: ${activeScenario.origin}\n[Симптомы/Особенности]: ${activeScenario.symptoms}`,
+        scenarioCounters: activeScenarioCounters,
         symptomDescription: symptomDesc,
         currentDate: nextDateStr,
         elapsedDays,
@@ -556,15 +572,21 @@ export default function App() {
           const daysGenerated = lastDayInChunk - elapsedDays;
           if (daysGenerated > 0) {
               const basePoints = daysGenerated * 10;
-              const currentZombies = getZombieCount(buildMapDataSnapshot(parsedEvents, parsedEvents.length - 1, mapSnapshots));
-              const zombieBonus = Math.floor(Math.max(0, Math.log10(currentZombies + 1) * 20));
-              setMutationPoints(prev => prev + basePoints + zombieBonus);
+              const latestCounterData = buildMapDataSnapshot(parsedEvents, parsedEvents.length - 1, mapSnapshots);
+              const pressureCounter = activeScenarioCounters[1] || activeScenarioCounters[0];
+              const pressureValue = getCounterValue(latestCounterData, pressureCounter?.key || 'infected');
+              const pressureBonus = Math.floor(Math.max(0, Math.log10(pressureValue + 1) * 20));
+              setMutationPoints(prev => prev + basePoints + pressureBonus);
           }
       }
 
     } catch (e: any) {
-      addNotification(`СИСТЕМНАЯ ОШИБКА: ${e.message}`, 'error');
+      const message = e.message || 'Неизвестная ошибка';
+      addNotification(message.includes('Не хватает') || message.includes('Недостаточно AI-кредитов')
+        ? `Не хватает кредитов: ${message}`
+        : `СИСТЕМНАЯ ОШИБКА: ${message}`, 'error');
     } finally {
+      refreshBillingSummary();
       setIsSimulating(false);
     }
   };
@@ -574,10 +596,11 @@ export default function App() {
     return buildMapDataSnapshot(parsedEvents, selectedDayIndex, mapSnapshots);
   }, [parsedEvents, selectedDayIndex, mapSnapshots]);
 
-  const outbreakCounters = useMemo(() => ({
-    infected: getInfectionCount(currentDayMapData),
-    zombies: getZombieCount(currentDayMapData)
-  }), [currentDayMapData]);
+  const outbreakCounters = useMemo(() => {
+    return Object.fromEntries(
+      activeScenarioCounters.map(counter => [counter.key, getCounterValue(currentDayMapData, counter.key)])
+    ) as Record<string, number>;
+  }, [activeScenarioCounters, currentDayMapData]);
 
   const currentEvent = parsedEvents[selectedDayIndex];
 
@@ -608,6 +631,7 @@ export default function App() {
     } catch (e: any) {
       alert("Ошибка при оценке мутации: " + e.message);
     } finally {
+      refreshBillingSummary();
       setIsEvaluating(false);
     }
   };
@@ -643,6 +667,10 @@ export default function App() {
     }
   };
 
+  if (isInitializing) {
+    return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">Loading...</div>;
+  }
+
   if (!isAuthed) {
     return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
   }
@@ -651,7 +679,14 @@ export default function App() {
     <div className="bg-[#050505] text-[#A3A3A3] w-full h-screen font-mono flex flex-col select-none">
       <Suspense fallback={<LoadingUI />}>
       {isMainMenu ? (
-        isScenarioSelectOpen ? (
+        isBalanceScreenOpen ? (
+          <BalanceScreen
+            onBack={() => setIsBalanceScreenOpen(false)}
+            onSummaryChange={setBillingSummary}
+          />
+        ) : isAdminScreenOpen ? (
+          <AdminScreen onBack={() => setIsAdminScreenOpen(false)} />
+        ) : isScenarioSelectOpen ? (
           <ScenarioSelectScreen
             scenarios={scenarios}
             selectedScenarioId={selectedScenarioId}
@@ -682,7 +717,11 @@ export default function App() {
             setIsScenarioSelectOpen(true);
           }}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          onOpenBalance={() => setIsBalanceScreenOpen(true)}
+          onOpenAdmin={() => setIsAdminScreenOpen(true)}
           onLogout={handleLogout}
+          isAdmin={Boolean(billingSummary?.isAdmin)}
+          availableCredits={billingSummary?.availableCredits || 0}
         />
         )
       ) : (
@@ -711,6 +750,23 @@ export default function App() {
               <span className="text-white">Lat: {location[0].toFixed(2)}, Lng: {location[1].toFixed(2)}</span>
             </div>
           </div>
+          <button
+            onClick={() => {
+              setIsMainMenu(true);
+              setIsBalanceScreenOpen(true);
+              setIsAdminScreenOpen(false);
+            }}
+            className={`hidden md:flex items-center gap-2 border px-3 py-2 text-[10px] uppercase font-bold ${
+              billingSummary?.lowBalance
+                ? 'border-red-700 bg-red-950/30 text-red-200'
+                : 'border-[#333] bg-[#111] text-green-300'
+            }`}
+            title="Открыть баланс"
+          >
+            {billingSummary?.lowBalance ? <AlertTriangle className="w-4 h-4" /> : <Wallet className="w-4 h-4" />}
+            <span>{(billingSummary?.availableCredits || 0).toFixed(1)} CR</span>
+            {(billingSummary?.reservedCredits || 0) > 0 && <span className="text-orange-300">R {(billingSummary?.reservedCredits || 0).toFixed(1)}</span>}
+          </button>
           <div className="flex items-center gap-1 bg-[#111] border border-[#222] p-1 rounded">
              <button onClick={() => setMainView('map')} className={`px-2 md:px-3 py-1 text-[10px] uppercase font-bold transition-colors ${mainView === 'map' ? 'bg-[#333] text-white' : 'text-[#555] hover:text-[#A3A3A3]'}`}>Map</button>
              <button onClick={() => setMainView('split')} className={`px-2 md:px-3 py-1 text-[10px] uppercase font-bold transition-colors hidden md:block ${mainView === 'split' ? 'bg-[#333] text-white' : 'text-[#555] hover:text-[#A3A3A3]'}`}>Split</button>
@@ -869,25 +925,24 @@ export default function App() {
                  <div className="relative overflow-hidden border border-cyan-300/70 bg-[#06141b]/88 shadow-[0_0_24px_rgba(34,211,238,0.16),inset_0_0_26px_rgba(34,211,238,0.08)] backdrop-blur-sm [clip-path:polygon(0_0,92%_0,100%_24%,100%_100%,4%_100%,0_76%)]">
                    <div className="absolute inset-x-0 top-0 h-px bg-cyan-100/75" />
                    <div className="absolute inset-0 opacity-20 [background:repeating-linear-gradient(0deg,transparent_0,transparent_4px,rgba(125,211,252,0.28)_5px)]" />
-                   <div className="relative grid grid-cols-2 divide-x divide-cyan-300/35">
-                     <div className="flex min-w-0 items-center gap-3 px-4 py-3 md:px-6">
-                       <Biohazard className="h-7 w-7 shrink-0 text-cyan-100 drop-shadow-[0_0_8px_rgba(165,243,252,0.65)]" strokeWidth={1.7} />
-                       <div className="min-w-0">
-                         <div className="truncate text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-100/82">Заражены</div>
-                         <div className="text-2xl font-bold leading-none text-white drop-shadow-[0_0_10px_rgba(255,255,255,0.35)] md:text-3xl">
-                           {formatCounter(outbreakCounters.infected)}
+                   <div
+                     className="relative grid divide-x divide-cyan-300/35"
+                     style={{ gridTemplateColumns: `repeat(${Math.min(Math.max(activeScenarioCounters.length, 1), 4)}, minmax(0, 1fr))` }}
+                   >
+                     {activeScenarioCounters.slice(0, 4).map((counter, index) => {
+                       const CounterIcon = index === 0 ? Biohazard : index === 1 ? Skull : Dna;
+                       return (
+                         <div key={counter.id || counter.key} className="flex min-w-0 items-center gap-3 px-3 py-3 md:px-5">
+                           <CounterIcon className="h-7 w-7 shrink-0 text-cyan-100 drop-shadow-[0_0_8px_rgba(165,243,252,0.65)]" strokeWidth={1.7} />
+                           <div className="min-w-0">
+                             <div className="truncate text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-100/82">{counter.label}</div>
+                             <div className="text-2xl font-bold leading-none text-white drop-shadow-[0_0_10px_rgba(255,255,255,0.35)] md:text-3xl">
+                               {formatCounter(outbreakCounters[counter.key] || 0)}
+                             </div>
+                           </div>
                          </div>
-                       </div>
-                     </div>
-                     <div className="flex min-w-0 items-center gap-3 px-4 py-3 md:px-6">
-                       <Skull className="h-7 w-7 shrink-0 text-cyan-100 drop-shadow-[0_0_8px_rgba(165,243,252,0.65)]" strokeWidth={1.7} />
-                       <div className="min-w-0">
-                         <div className="truncate text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-100/82">Зомби</div>
-                         <div className="text-2xl font-bold leading-none text-white drop-shadow-[0_0_10px_rgba(255,255,255,0.35)] md:text-3xl">
-                           {formatCounter(outbreakCounters.zombies)}
-                         </div>
-                       </div>
-                     </div>
+                       );
+                     })}
                    </div>
                    <div className="absolute bottom-2 left-5 right-5 h-[3px] border border-cyan-200/55 bg-cyan-500/25">
                      <div className="h-full w-full bg-gradient-to-r from-cyan-500/30 via-cyan-200/80 to-cyan-500/30" />
@@ -1049,7 +1104,11 @@ export default function App() {
           </button>
         </div>
         <div className="hidden lg:flex gap-4">
-          <span className="text-red-900 font-bold">SIMULATION IS FOR MILITARY PURPOSES ONLY</span>
+          {billingSummary?.lowBalance ? (
+            <span className="text-orange-400 font-bold">LOW CREDIT BALANCE / ПОПОЛНИТЕ БАЛАНС</span>
+          ) : (
+            <span className="text-red-900 font-bold">SIMULATION IS FOR MILITARY PURPOSES ONLY</span>
+          )}
         </div>
       </footer>
         </>

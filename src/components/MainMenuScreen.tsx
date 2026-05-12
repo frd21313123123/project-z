@@ -1,4 +1,4 @@
-import { Settings, LogOut, Play, Biohazard, X, UserRound } from 'lucide-react';
+import { Settings, LogOut, Play, Biohazard, X, UserRound, Wallet, ShieldCheck } from 'lucide-react';
 import menuBackground from '../../background.png';
 
 interface MainMenuScreenProps {
@@ -8,7 +8,11 @@ interface MainMenuScreenProps {
   onCloseRoleSelect: () => void;
   onStartVirusGame: () => void;
   onOpenSettings: () => void;
+  onOpenBalance: () => void;
+  onOpenAdmin: () => void;
   onLogout: () => void;
+  isAdmin?: boolean;
+  availableCredits?: number;
 }
 
 export function MainMenuScreen({
@@ -18,7 +22,11 @@ export function MainMenuScreen({
   onCloseRoleSelect,
   onStartVirusGame,
   onOpenSettings,
+  onOpenBalance,
+  onOpenAdmin,
   onLogout,
+  isAdmin = false,
+  availableCredits = 0,
 }: MainMenuScreenProps) {
   return (
     <section
@@ -54,9 +62,19 @@ export function MainMenuScreen({
               <Settings className="w-5 h-5" />
               <span>Настройки</span>
             </button>
+            <button className="menu-action-button" onClick={onOpenBalance}>
+              <Wallet className="w-5 h-5" />
+              <span>Баланс</span>
+            </button>
+            {isAdmin && (
+              <button className="menu-action-button" onClick={onOpenAdmin}>
+                <ShieldCheck className="w-5 h-5" />
+                <span>Админка</span>
+              </button>
+            )}
           </div>
           <div className="flex items-center justify-between border-t border-red-500/30 px-6 py-4 text-[10px] uppercase tracking-[0.2em] text-red-100/50">
-            <span>{username || 'Operator'}</span>
+            <span>{username || 'Operator'} · {availableCredits.toFixed(1)} CR</span>
             <button
               onClick={onLogout}
               className="flex items-center gap-2 text-red-100/50 transition-colors hover:text-red-100"

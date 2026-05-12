@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Biohazard, Plus, Pencil, Trash2, ChevronLeft, ChevronRight, X, Check } from 'lucide-react';
-import type { Scenario } from '../lib/auth';
+import { DEFAULT_SCENARIO_COUNTERS, type Scenario, type ScenarioCounter } from '../lib/auth';
 import menuBackground from '../../background.png';
 
 interface ScenarioSelectScreenProps {
@@ -10,7 +10,7 @@ interface ScenarioSelectScreenProps {
   onSelectScenario: (id: string) => void;
   onAddScenario: () => string;
   onDeleteScenario: (id: string) => void;
-  onUpdateScenario: (id: string, field: keyof Scenario, value: string) => void;
+  onUpdateScenario: (id: string, field: keyof Scenario, value: Scenario[keyof Scenario]) => void;
   onBack: () => void;
   onContinue: () => void;
 }
@@ -28,6 +28,7 @@ export function ScenarioSelectScreen({
 }: ScenarioSelectScreenProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const editingScenario = scenarios.find(s => s.id === editingId) || null;
+  const editingCounters = editingScenario?.counters?.length ? editingScenario.counters : DEFAULT_SCENARIO_COUNTERS;
 
   useEffect(() => {
     if (editingId && !scenarios.some(s => s.id === editingId)) {
@@ -43,6 +44,45 @@ export function ScenarioSelectScreen({
   const beginEditScenario = (id: string) => {
     onSelectScenario(id);
     setEditingId(id);
+  };
+
+  const sanitizeCounterKey = (value: string, index: number) => (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_|_$/g, '') || `counter_${index + 1}`
+  );
+
+  const updateCounter = (counterId: string, field: keyof ScenarioCounter, value: string) => {
+    if (!editingScenario) return;
+    const counters = editingCounters.map((counter, index) => {
+      if (counter.id !== counterId) return counter;
+      return {
+        ...counter,
+        [field]: field === 'key' ? sanitizeCounterKey(value, index) : value,
+      };
+    });
+    onUpdateScenario(editingScenario.id, 'counters', counters);
+  };
+
+  const addCounter = () => {
+    if (!editingScenario) return;
+    const nextIndex = editingCounters.length;
+    onUpdateScenario(editingScenario.id, 'counters', [
+      ...editingCounters,
+      {
+        id: `counter_${Date.now()}`,
+        key: `counter_${nextIndex + 1}`,
+        label: `Счетчик ${nextIndex + 1}`,
+        description: 'Опишите, кого или что должен считать мастер симуляции.',
+      },
+    ]);
+  };
+
+  const removeCounter = (counterId: string) => {
+    if (!editingScenario || editingCounters.length <= 1) return;
+    onUpdateScenario(editingScenario.id, 'counters', editingCounters.filter(counter => counter.id !== counterId));
   };
 
   const detailSections = [
@@ -219,6 +259,52 @@ export function ScenarioSelectScreen({
                   placeholder="Симптомы, передача, ограничения и правила"
                 />
               </label>
+              <div className="scenario-editor-field md:col-span-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span>Счетчики состояния</span>
+                  <button
+                    type="button"
+                    className="scenario-small-action"
+                    onClick={addCounter}
+                    disabled={editingCounters.length >= 6}
+                  >
+                    <Plus className="h-4 w-4" />
+                    <span>Добавить</span>
+                  </button>
+                </div>
+                <div className="grid gap-3">
+                  {editingCounters.map((counter, index) => (
+                    <div key={counter.id} className="scenario-counter-editor">
+                      <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(120px,180px)_auto]">
+                        <input
+                          value={counter.label}
+                          onChange={e => updateCounter(counter.id, 'label', e.target.value)}
+                          placeholder="Название: Вампиры"
+                        />
+                        <input
+                          value={counter.key}
+                          onChange={e => updateCounter(counter.id, 'key', e.target.value)}
+                          placeholder="Ключ: vampires"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => removeCounter(counter.id)}
+                          disabled={editingCounters.length <= 1}
+                          aria-label="Удалить счетчик"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                      <textarea
+                        rows={2}
+                        value={counter.description}
+                        onChange={e => updateCounter(counter.id, 'description', e.target.value)}
+                        placeholder={index === 0 ? 'Например: зараженные, которые еще не превратились.' : 'Например: превращенные вампиры, мертвые, подчиненные или другая группа.'}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
             <div className="mt-5 flex items-center justify-between gap-3 border-t border-red-500/25 pt-4">
               <button

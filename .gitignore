@@ -29,3 +29,8 @@ coverage/
 .env*
 !.env.example
 *.local
+
+# Runtime data
+data/billing.sqlite*
+data/sessions.json
+data/users.json
